@@ -5,14 +5,17 @@ import lombok.*;
 import org.hibernate.annotations.CreationTimestamp;
 
 import java.time.LocalDateTime;
+import java.util.Objects;
 import java.util.UUID;
 
 @Entity
 @Table(name = "fraud_alerts")
-@Data
+@Getter
+@Setter
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
+@ToString(exclude = {"user", "transaction"})
 public class FraudAlert {
 
     @Id
@@ -42,6 +45,10 @@ public class FraudAlert {
     @Column(columnDefinition = "TEXT")
     private String details; // JSON details about the alert
 
+    private LocalDateTime resolvedAt;
+
+    private String resolvedBy; // Email of the agent/admin who resolved
+
     @CreationTimestamp
     private LocalDateTime createdAt;
 
@@ -58,5 +65,18 @@ public class FraudAlert {
         INVESTIGATING,
         RESOLVED,
         FALSE_POSITIVE
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        FraudAlert that = (FraudAlert) o;
+        return id != null && Objects.equals(id, that.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
     }
 }

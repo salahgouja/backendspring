@@ -85,8 +85,10 @@ public class SecurityConfig {
 
                                 // Authorization rules
                                 .authorizeHttpRequests(auth -> auth
-                                                // ── Public endpoints ──────────────────────────
-                                                .requestMatchers("/auth/**").permitAll()
+                                                // ── Public endpoints (no auth required) ──────
+                                                .requestMatchers("/auth/register", "/auth/login",
+                                                                "/auth/refresh", "/auth/2fa/verify")
+                                                .permitAll()
                                                 .requestMatchers("/agencies/**").permitAll()
                                                 .requestMatchers("/swagger-ui/**", "/api-docs/**", "/v3/api-docs/**")
                                                 .permitAll()
@@ -97,6 +99,7 @@ public class SecurityConfig {
 
                                                 // ── Agent + Admin endpoints ───────────────────
                                                 .requestMatchers("/agent/**").hasAnyRole("AGENT", "ADMIN")
+                                                .requestMatchers("/fraud-alerts/**").hasAnyRole("AGENT", "ADMIN")
 
                                                 // ── All other endpoints require authentication ─
                                                 .anyRequest().authenticated())

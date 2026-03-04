@@ -48,6 +48,7 @@ public class JwtTokenProvider {
     // Cached Components (initialized in @PostConstruct)
     // ============================================================
     private SecretKey key;
+    private JwtParser cachedParser; // Fix #27: cache parser instance
 
     // ============================================================
     // Token Blacklist for Logout
@@ -79,6 +80,9 @@ public class JwtTokenProvider {
         // Initialize secret key once
         this.key = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
         
+        // Fix #27: Cache parser instance
+        this.cachedParser = Jwts.parser().verifyWith(key).build();
+
         // Start background cleanup thread
         cleanupExecutor.scheduleAtFixedRate(
                 this::cleanupBlacklist,
@@ -139,6 +143,14 @@ public class JwtTokenProvider {
      */
     public String generateRefreshToken(String email) {
         return buildToken(email, refreshExpiration, "refresh");
+    }
+
+    /**
+     * Generate short-lived temp token for 2FA verification (fix #1).
+     * This token is NOT a full access token — only valid for /auth/verify-2fa.
+     */
+    public String generateTempToken(String email) {
+        return buildToken(email, 300_000L, "temp"); // 5 minutes
     }
 
     // ============================================================
@@ -280,23 +292,17 @@ public class JwtTokenProvider {
     // ============================================================
 
     /**
-     * Get configured JWT parser (cached)
+     * Get configured JWT parser (cached - fix #27)
      */
     private JwtParser getParser() {
-        return Jwts.parser()
-                .verifyWith(key)
-                .build();
+        return cachedParser;
     }
 
     /**
-     * Extract claims from token
+     * Extract claims from token (uses cached parser - fix #27)
      */
     private Claims getClaimsFromToken(String token) {
-        return Jwts.parser()
-                .verifyWith(key)
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
+        return cachedParser.parseSignedClaims(token).getPayload();
     }
 
     // ============================================================

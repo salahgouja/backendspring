@@ -6,14 +6,17 @@ import org.hibernate.annotations.CreationTimestamp;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.Objects;
 import java.util.UUID;
 
 @Entity
 @Table(name = "credit_requests")
-@Data
+@Getter
+@Setter
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
+@ToString(exclude = {"user"})
 public class CreditRequest {
 
     @Id
@@ -66,6 +69,20 @@ public class CreditRequest {
         IN_REVIEW, // Under review
         APPROVED,
         REJECTED,
+        CANCELLED, // Cancelled by the client
         DISBURSED // Money credited to client's account
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        CreditRequest that = (CreditRequest) o;
+        return id != null && Objects.equals(id, that.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
     }
 }

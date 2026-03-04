@@ -52,6 +52,13 @@ public class CreditController {
         return ResponseEntity.ok(creditService.getCreditById(auth.getName(), id));
     }
 
+    // ── Cancel credit (fix #20) ──────────────────────────
+    @PutMapping("/{id}/cancel")
+    @Operation(summary = "Annuler une demande de crédit (avant revue)")
+    public ResponseEntity<CreditResponse> cancelCredit(Authentication auth, @PathVariable UUID id) {
+        return ResponseEntity.ok(creditService.cancelCredit(auth.getName(), id));
+    }
+
     // ── Agent / Admin endpoints ───────────────────────────
 
     @GetMapping("/pending")

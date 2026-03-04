@@ -42,4 +42,9 @@ public interface AccountRepository extends JpaRepository<Account, UUID> {
      * Find all accounts pending approval (for admin)
      */
     List<Account> findByStatusOrderByCreatedAtDesc(Account.AccountStatus status);
+
+    long countByStatus(Account.AccountStatus status);
+
+    @Query("SELECT a FROM Account a JOIN a.user u WHERE u.agency.id = :agencyId AND a.status IN :statuses ORDER BY a.createdAt DESC")
+    List<Account> findByUserAgencyIdAndStatusIn(UUID agencyId, List<Account.AccountStatus> statuses);
 }

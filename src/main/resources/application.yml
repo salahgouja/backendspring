@@ -27,7 +27,7 @@ spring:
 
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: create
     show-sql: false
     properties:
       hibernate:
@@ -60,6 +60,10 @@ app:
     max-amount-per-transaction: ${MAX_TRANSFER_AMOUNT:100000.000}
     max-daily-amount: ${MAX_DAILY_TRANSFER:500000.000}
     min-amount: ${MIN_TRANSFER_AMOUNT:0.001}
+  fraud:
+    unusual-amount-threshold: ${FRAUD_AMOUNT_THRESHOLD:50000.000}
+    velocity-window-minutes: ${FRAUD_VELOCITY_WINDOW:30}
+    velocity-max-count: ${FRAUD_VELOCITY_MAX:5}
 
 # ── CORS (allow React frontend) ───────────────────────
 cors:

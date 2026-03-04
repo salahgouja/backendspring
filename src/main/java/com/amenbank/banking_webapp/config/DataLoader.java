@@ -11,6 +11,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.util.LinkedHashMap;
@@ -30,6 +31,7 @@ public class DataLoader implements CommandLineRunner {
         private final PasswordEncoder passwordEncoder;
 
         @Override
+        @Transactional
         public void run(String... args) {
                 // ── 1. Seed Agencies ──────────────────────────────────
                 seedAgencies();
@@ -168,6 +170,7 @@ public class DataLoader implements CommandLineRunner {
                                 .cin(cin)
                                 .userType(type)
                                 .agency(agency)
+                                .failedLoginAttempts(0)
                                 .build();
                 userRepository.save(user);
 
@@ -181,6 +184,7 @@ public class DataLoader implements CommandLineRunner {
                                                         ? Account.AccountType.COMMERCIAL
                                                         : Account.AccountType.COURANT)
                                         .balance(initialBalance)
+                                        .currency("TND")
                                         .isActive(true)
                                         .status(Account.AccountStatus.ACTIVE)
                                         .build();

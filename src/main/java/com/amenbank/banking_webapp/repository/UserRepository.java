@@ -25,4 +25,12 @@ public interface UserRepository extends JpaRepository<User, UUID> {
     boolean existsByCin(String cin);
 
     List<User> findByUserTypeAndAgency(User.UserType userType, Agency agency);
+
+    long countByUserType(User.UserType userType);
+
+    long countByIsActiveTrue();
+
+    long countByIsActiveFalse();
+
+    long countByIs2faEnabledTrue();
 }

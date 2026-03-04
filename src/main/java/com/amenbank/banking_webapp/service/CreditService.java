@@ -32,6 +32,7 @@ public class CreditService {
         private final UserRepository userRepository;
         private final AccountRepository accountRepository;
         private final TransactionRepository transactionRepository;
+        private final AuditService auditService;
 
         // ── Interest rates by credit type (annual %) ───────────
         private static final Map<CreditRequest.CreditType, BigDecimal> INTEREST_RATES = Map.of(
@@ -93,6 +94,40 @@ public class CreditService {
                                                 request.getDurationMonths(), monthlyPayment))
                                 .build());
 
+                auditService.log(AuditLog.AuditAction.CREDIT_SUBMITTED, userEmail,
+                        "CreditRequest", credit.getId().toString(),
+                        credit.getCreditType() + " " + credit.getAmountRequested() + " TND");
+
+                return toResponse(credit);
+        }
+
+        // ── Cancel credit (fix #20) ───────────────────────────
+        @Transactional
+        public CreditResponse cancelCredit(String userEmail, UUID creditId) {
+                User user = userRepository.findByEmail(userEmail)
+                                .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
+                CreditRequest credit = creditRequestRepository.findById(creditId)
+                                .orElseThrow(() -> new NotFoundException(CREDIT_NOT_FOUND));
+                if (!credit.getUser().getId().equals(user.getId())) {
+                        throw new ForbiddenException("Cette demande de crédit ne vous appartient pas");
+                }
+                if (credit.getStatus() != CreditRequest.CreditStatus.SUBMITTED
+                                && credit.getStatus() != CreditRequest.CreditStatus.SIMULATION) {
+                        throw new BankingException("Impossible d'annuler (statut actuel: " + credit.getStatus() + ")");
+                }
+                credit.setStatus(CreditRequest.CreditStatus.CANCELLED);
+                credit.setDecidedAt(LocalDateTime.now());
+                creditRequestRepository.save(credit);
+
+                notificationRepository.save(Notification.builder()
+                                .user(user).type(Notification.NotificationType.CREDIT)
+                                .title("Demande de crédit annulée")
+                                .body(String.format("Votre demande de crédit %s de %.3f TND a été annulée.",
+                                                credit.getCreditType().name(), credit.getAmountRequested()))
+                                .build());
+
+                auditService.log(AuditLog.AuditAction.CREDIT_CANCELLED, userEmail,
+                        "CreditRequest", credit.getId().toString(), "Cancelled by client");
                 return toResponse(credit);
         }
 
@@ -195,6 +230,10 @@ public class CreditService {
                                 .body(notifBody)
                                 .build());
 
+                auditService.log(AuditLog.AuditAction.CREDIT_REVIEWED, "agent",
+                        "CreditRequest", credit.getId().toString(),
+                        "Decision: " + request.getDecision());
+
                 return toResponse(credit);
         }
 
@@ -249,6 +288,10 @@ public class CreditService {
                                                 credit.getCreditType().name(), credit.getAmountRequested(),
                                                 targetAccount.getAccountNumber(), targetAccount.getBalance()))
                                 .build());
+
+                auditService.log(AuditLog.AuditAction.CREDIT_DISBURSED, "admin",
+                        "CreditRequest", credit.getId().toString(),
+                        "Disbursed " + credit.getAmountRequested() + " TND to " + targetAccount.getAccountNumber());
 
                 return toResponse(credit);
         }

@@ -18,5 +18,9 @@ public interface TransactionRepository extends JpaRepository<Transaction, UUID> 
     List<Transaction> findByAccountIdAndCreatedAtBetween(
             UUID accountId, LocalDateTime start, LocalDateTime end);
 
+    // Paginated date range filter (fix #30)
+    Page<Transaction> findByAccountIdAndCreatedAtBetweenOrderByCreatedAtDesc(
+            UUID accountId, LocalDateTime start, LocalDateTime end, Pageable pageable);
+
     List<Transaction> findByAccountUserIdOrderByCreatedAtDesc(UUID userId);
 }

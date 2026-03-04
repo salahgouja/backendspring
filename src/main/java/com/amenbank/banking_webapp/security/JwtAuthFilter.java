@@ -121,13 +121,7 @@ public class JwtAuthFilter extends OncePerRequestFilter {
             return bearerToken.substring(BEARER_PREFIX.length());
         }
         
-        // Also check query parameter (less secure, but sometimes needed)
-        String queryToken = request.getParameter("token");
-        if (StringUtils.hasText(queryToken)) {
-            log.warn("{}: Token extracted from query parameter - less secure!", BEAN_NAME);
-            return queryToken;
-        }
-        
+        // Fix #3: Removed query parameter token extraction — leaks tokens in logs/history
         return null;
     }
 
@@ -139,7 +133,11 @@ public class JwtAuthFilter extends OncePerRequestFilter {
         String path = request.getRequestURI();
         
         // Skip public endpoints
-        return path.startsWith("/auth/") ||
+        return path.equals("/auth/register") ||
+               path.equals("/auth/login") ||
+               path.equals("/auth/refresh") ||
+               path.equals("/auth/2fa/verify") ||
+               path.startsWith("/agencies/") ||
                path.startsWith("/swagger-ui/") ||
                path.startsWith("/api-docs/") ||
                path.startsWith("/v3/api-docs") ||

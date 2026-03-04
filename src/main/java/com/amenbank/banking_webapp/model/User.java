@@ -8,19 +8,25 @@ import org.hibernate.annotations.UpdateTimestamp;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Objects;
 import java.util.UUID;
 
 @Entity
 @Table(name = "users")
-@Data
+@Getter
+@Setter
 @Builder
 @NoArgsConstructor
 @AllArgsConstructor
+@ToString(exclude = {"accounts", "notifications", "agency"})
 public class User {
 
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
+
+    @Version
+    private Long version;
 
     @Column(unique = true, nullable = false)
     private String email;
@@ -56,6 +62,12 @@ public class User {
     @JsonIgnore
     private String totpSecret; // For Google Authenticator
 
+    @Column(nullable = false)
+    @Builder.Default
+    private Integer failedLoginAttempts = 0;
+
+    private LocalDateTime lockUntil; // Account locked until this time
+
     @CreationTimestamp
     private LocalDateTime createdAt;
 
@@ -81,5 +93,19 @@ public class User {
         COMMERCANT, // Small merchant
         AGENT, // Bank branch employee
         ADMIN // System administrator
+    }
+
+    // ── equals / hashCode on id ────────────────────────
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        User user = (User) o;
+        return id != null && Objects.equals(id, user.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return getClass().hashCode();
     }
 }

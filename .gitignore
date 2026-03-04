@@ -34,3 +34,5 @@ build/
 
 ### Environment ###
 .env
+### folder for explanation ###
+explanation/
