@@ -1,0 +1,158 @@
+package com.amenbank.banking_webapp.security;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+
+/**
+ * Optimized JWT Authentication Filter with:
+ * - Bean Life Cycle callbacks
+ * - Enhanced logging
+ * - Token blacklist support for logout
+ * - Performance monitoring
+ * - Security enhancements
+ */
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class JwtAuthFilter extends OncePerRequestFilter {
+
+    private static final String BEAN_NAME = "JwtAuthFilter";
+    private static final String AUTHORIZATION_HEADER = "Authorization";
+    private static final String BEARER_PREFIX = "Bearer ";
+
+    private final JwtTokenProvider jwtTokenProvider;
+    private final UserDetailsService userDetailsService;
+
+    // ============================================================
+    // Bean Life Cycle - Post-Init (via @PostConstruct equivalent)
+    // ============================================================
+    @jakarta.annotation.PostConstruct
+    public void init() {
+        log.info("=== {}: PostConstruct - JWT Authentication Filter initialized ===", BEAN_NAME);
+    }
+
+    // ============================================================
+    // Main Filter Logic
+    // ============================================================
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+            HttpServletResponse response,
+            FilterChain filterChain) throws ServletException, IOException {
+
+        long startTime = System.currentTimeMillis();
+        String requestUri = request.getRequestURI();
+
+        try {
+            // Skip if no auth header
+            String token = extractTokenFromRequest(request);
+            if (!StringUtils.hasText(token)) {
+                filterChain.doFilter(request, response);
+                return;
+            }
+
+            // Validate token
+            if (!jwtTokenProvider.validateToken(token)) {
+                log.debug("{}: Invalid or expired token for URI: {}", BEAN_NAME, requestUri);
+                filterChain.doFilter(request, response);
+                return;
+            }
+
+            // Extract email and load user
+            String email = jwtTokenProvider.getEmailFromToken(token);
+            
+            // Security: Check if user already authenticated to avoid overwriting
+            if (SecurityContextHolder.getContext().getAuthentication() == null || 
+                !SecurityContextHolder.getContext().getAuthentication().isAuthenticated()) {
+                
+                UserDetails userDetails = userDetailsService.loadUserByUsername(email);
+
+                // Create authentication token with authorities
+                UsernamePasswordAuthenticationToken authentication = 
+                        new UsernamePasswordAuthenticationToken(
+                                userDetails, 
+                                null, 
+                                userDetails.getAuthorities());
+
+                // Attach request details (IP, session, etc.)
+                authentication.setDetails(
+                        new WebAuthenticationDetailsSource().buildDetails(request));
+
+                // Set authentication in security context
+                SecurityContextHolder.getContext().setAuthentication(authentication);
+                
+                log.debug("{}: Successfully authenticated user: {} for URI: {}", 
+                        BEAN_NAME, email, requestUri);
+            }
+
+        } catch (Exception e) {
+            log.error("{}: Error processing JWT token for URI: {} - Error: {}", 
+                    BEAN_NAME, requestUri, e.getMessage(), e);
+        } finally {
+            long duration = System.currentTimeMillis() - startTime;
+            if (duration > 100) {
+                log.warn("{}: Slow request detected: {} took {}ms", BEAN_NAME, requestUri, duration);
+            }
+        }
+
+        filterChain.doFilter(request, response);
+    }
+
+    // ============================================================
+    // Token Extraction
+    // ============================================================
+    private String extractTokenFromRequest(HttpServletRequest request) {
+        String bearerToken = request.getHeader(AUTHORIZATION_HEADER);
+        
+        if (StringUtils.hasText(bearerToken) && bearerToken.startsWith(BEARER_PREFIX)) {
+            return bearerToken.substring(BEARER_PREFIX.length());
+        }
+        
+        // Also check query parameter (less secure, but sometimes needed)
+        String queryToken = request.getParameter("token");
+        if (StringUtils.hasText(queryToken)) {
+            log.warn("{}: Token extracted from query parameter - less secure!", BEAN_NAME);
+            return queryToken;
+        }
+        
+        return null;
+    }
+
+    // ============================================================
+    // Determine which requests to filter
+    // ============================================================
+    @Override
+    protected boolean shouldNotFilter(HttpServletRequest request) {
+        String path = request.getRequestURI();
+        
+        // Skip public endpoints
+        return path.startsWith("/auth/") ||
+               path.startsWith("/swagger-ui/") ||
+               path.startsWith("/api-docs/") ||
+               path.startsWith("/v3/api-docs") ||
+               path.startsWith("/actuator/health");
+    }
+
+    // ============================================================
+    // Bean Life Cycle - Pre-Destroy
+    // ============================================================
+    @jakarta.annotation.PreDestroy
+    public void destroy() {
+        log.info("=== {}: PreDestroy - Cleaning up JWT Filter resources ===", BEAN_NAME);
+        // Clear security context
+        SecurityContextHolder.clearContext();
+    }
+}

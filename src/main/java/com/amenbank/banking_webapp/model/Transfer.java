@@ -1,0 +1,71 @@
+package com.amenbank.banking_webapp.model;
+
+import jakarta.persistence.*;
+import lombok.*;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+@Entity
+@Table(name = "transfers")
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class Transfer {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.UUID)
+    private UUID id;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "sender_user_id", nullable = false)
+    private User senderUser;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "sender_account_id", nullable = false)
+    private Account senderAccount;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "receiver_account_id", nullable = false)
+    private Account receiverAccount;
+
+    private String receiverName;
+
+    @Column(nullable = false, precision = 15, scale = 3)
+    private BigDecimal amount;
+
+    @Column(nullable = false, length = 3)
+    @Builder.Default
+    private String currency = "TND";
+
+    private String motif; // Purpose of the transfer
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    @Builder.Default
+    private TransferStatus status = TransferStatus.PENDING;
+
+    @Column(nullable = false)
+    @Builder.Default
+    private Boolean isRecurring = false;
+
+    private String recurrenceRule; // Cron expression, e.g. "0 0 10 * *"
+
+    private LocalDateTime scheduledAt;
+    private LocalDateTime executedAt;
+
+    @CreationTimestamp
+    private LocalDateTime createdAt;
+
+    // ── Enum ───────────────────────────────────────────
+    public enum TransferStatus {
+        PENDING,
+        VALIDATED, // User confirmed + 2FA passed
+        EXECUTED, // Transfer completed
+        FAILED,
+        CANCELLED
+    }
+}

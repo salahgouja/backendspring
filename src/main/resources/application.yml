@@ -1,0 +1,83 @@
+# ══════════════════════════════════════════════════════════
+# Amen Bank - Core Banking API Configuration
+# Values loaded from .env file via ${ENV_VAR:default}
+# ══════════════════════════════════════════════════════════
+
+server:
+  port: ${SERVER_PORT:8080}
+  servlet:
+    context-path: /api
+
+spring:
+  application:
+    name: amenbank-core-banking
+
+  # ── PostgreSQL Database ──────────────────────────────
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:amenbank}
+    username: ${DB_USERNAME:amenbank}
+    password: ${DB_PASSWORD:amenbank_dev_2024}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+    open-in-view: false
+
+  # ── Redis ────────────────────────────────────────────
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+
+  # ── Caching ──────────────────────────────────────────
+  cache:
+    type: simple
+    cache-names: userCache,tokenCache,accountCache,transactionCache,notificationCache
+
+# ── JWT Configuration ──────────────────────────────────
+jwt:
+  secret: ${JWT_SECRET:amenbank-jwt-secret-key-change-in-production-2024-must-be-256-bits-long-minimum}
+  expiration: ${JWT_EXPIRATION:86400000}
+  refresh-expiration: ${JWT_REFRESH_EXPIRATION:604800000}
+
+# ── Application Specific Configuration ────────────────
+app:
+  security:
+    min-password-length: ${MIN_PASSWORD_LENGTH:8}
+  transfer:
+    max-amount-per-transaction: ${MAX_TRANSFER_AMOUNT:100000.000}
+    max-daily-amount: ${MAX_DAILY_TRANSFER:500000.000}
+    min-amount: ${MIN_TRANSFER_AMOUNT:0.001}
+
+# ── CORS (allow React frontend) ───────────────────────
+cors:
+  allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000,http://localhost:5173,http://localhost:5174}
+  allowed-methods: GET,POST,PUT,DELETE,OPTIONS
+  allowed-headers: "*"
+
+# ── Swagger / OpenAPI ─────────────────────────────────
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    enabled: true
+
+# ── Logging Configuration ──────────────────────────────
+logging:
+  level:
+    com.amenbank: DEBUG
+    org.springframework.security: INFO
+    org.hibernate.SQL: WARN
