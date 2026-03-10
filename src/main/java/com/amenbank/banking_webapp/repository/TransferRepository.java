@@ -36,4 +36,15 @@ public interface TransferRepository extends JpaRepository<Transfer, UUID> {
 
     @Query("SELECT COUNT(t) FROM Transfer t WHERE t.senderUser.id = :userId AND t.createdAt >= :since")
     long countRecentTransfersByUser(@Param("userId") UUID userId, @Param("since") LocalDateTime since);
+
+    // GAP-4: Find all scheduled/recurring transfers for a user (PENDING status)
+    @Query("SELECT t FROM Transfer t WHERE t.senderUser.id = :userId " +
+           "AND (t.scheduledAt IS NOT NULL OR t.isRecurring = true) " +
+           "ORDER BY t.createdAt DESC")
+    Page<Transfer> findScheduledByUserId(@Param("userId") UUID userId, Pageable pageable);
+
+    // GAP-5: Find recurring transfers due within the next 24 hours for pre-notification
+    @Query("SELECT t FROM Transfer t WHERE t.isRecurring = true AND t.status = 'PENDING' " +
+           "AND t.scheduledAt IS NOT NULL AND t.scheduledAt <= :notifyBefore AND t.scheduledAt > :now")
+    List<Transfer> findRecurringTransfersDueSoon(@Param("now") LocalDateTime now, @Param("notifyBefore") LocalDateTime notifyBefore);
 }

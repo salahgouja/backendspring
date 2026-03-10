@@ -1,11 +1,16 @@
 package com.amenbank.banking_webapp.service;
 
+import com.amenbank.banking_webapp.dto.request.BatchTransferRequest;
+import com.amenbank.banking_webapp.dto.request.ScheduledTransferRequest;
 import com.amenbank.banking_webapp.dto.request.TransferRequest;
+import com.amenbank.banking_webapp.dto.response.BatchTransferResponse;
 import com.amenbank.banking_webapp.dto.response.TransferResponse;
 import com.amenbank.banking_webapp.exception.BankingException;
 import com.amenbank.banking_webapp.exception.BankingException.*;
 import com.amenbank.banking_webapp.model.*;
 import com.amenbank.banking_webapp.repository.*;
+import dev.samstevens.totp.code.*;
+import dev.samstevens.totp.time.SystemTimeProvider;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
@@ -36,8 +41,11 @@ public class TransferService {
     private final TransactionRepository transactionRepository;
     private final NotificationRepository notificationRepository;
     private final UserRepository userRepository;
+    private final BatchTransferRepository batchTransferRepository;
+    private final BatchTransferItemRepository batchTransferItemRepository;
     private final AuditService auditService;
     private final FraudService fraudService;
+    private final EmailService emailService;
 
     @Value("${app.transfer.max-amount-per-transaction:100000.000}")
     private BigDecimal maxAmountPerTransaction;
@@ -60,6 +68,94 @@ public class TransferService {
     }
 
     // ============================================================
+    // GAP-11: Self-Transfer (between own accounts — no 2FA, no daily limit)
+    // ============================================================
+    @Transactional
+    public TransferResponse createSelfTransfer(String userEmail, TransferRequest request) {
+        log.info("{}: Creating self-transfer for user: {}", BEAN_NAME, userEmail);
+
+        validateTransferAmount(request.getAmount());
+
+        User sender = userRepository.findByEmail(userEmail)
+                .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
+
+        // Load both accounts with locks
+        Account senderAccount = accountRepository.findByIdForUpdate(request.getSenderAccountId())
+                .orElseThrow(() -> new NotFoundException("Compte émetteur introuvable"));
+        verifyAccountOwnership(senderAccount, sender);
+        verifyAccountOperational(senderAccount, "émetteur");
+
+        Account receiverAccount = accountRepository.findByAccountNumberForUpdate(request.getReceiverAccountNumber())
+                .orElseThrow(() -> new NotFoundException("Compte destinataire introuvable: " + request.getReceiverAccountNumber()));
+
+        // Verify receiver is ALSO owned by the same user
+        if (!receiverAccount.getUser().getId().equals(sender.getId())) {
+            throw new BankingException("Le virement interne n'est possible qu'entre vos propres comptes. " +
+                    "Utilisez le virement normal pour envoyer à un autre utilisateur.");
+        }
+
+        verifyAccountOperational(receiverAccount, "destinataire");
+        verifyNotSameAccount(senderAccount, receiverAccount);
+        verifySameCurrency(senderAccount, receiverAccount);
+        verifySufficientBalance(senderAccount, request.getAmount());
+
+        // No 2FA check — it's the same user
+        // No daily limit check — internal movement
+
+        BigDecimal amount = request.getAmount();
+        senderAccount.setBalance(senderAccount.getBalance().subtract(amount));
+        accountRepository.save(senderAccount);
+        receiverAccount.setBalance(receiverAccount.getBalance().add(amount));
+        accountRepository.save(receiverAccount);
+
+        Transfer transfer = Transfer.builder()
+                .senderUser(sender)
+                .senderAccount(senderAccount)
+                .receiverAccount(receiverAccount)
+                .receiverName(sender.getFullNameFr() + " (virement interne)")
+                .amount(amount)
+                .motif(sanitizeMotif(request.getMotif() != null ? request.getMotif() : "Virement interne"))
+                .referenceNumber(generateReferenceNumber())
+                .status(Transfer.TransferStatus.EXECUTED)
+                .executedAt(LocalDateTime.now())
+                .build();
+        transferRepository.save(transfer);
+
+        // Create debit & credit transactions
+        transactionRepository.save(Transaction.builder()
+                .account(senderAccount).transfer(transfer)
+                .type(Transaction.TransactionType.DEBIT).amount(amount)
+                .balanceAfter(senderAccount.getBalance())
+                .description("Virement interne vers " + receiverAccount.getAccountNumber())
+                .category("virement_interne").build());
+
+        transactionRepository.save(Transaction.builder()
+                .account(receiverAccount).transfer(transfer)
+                .type(Transaction.TransactionType.CREDIT).amount(amount)
+                .balanceAfter(receiverAccount.getBalance())
+                .description("Virement interne de " + senderAccount.getAccountNumber())
+                .category("virement_interne").build());
+
+        notificationRepository.save(Notification.builder()
+                .user(sender).type(Notification.NotificationType.TRANSFER)
+                .title("Virement interne effectué")
+                .body(String.format("%.3f TND transférés de %s vers %s.",
+                        amount, senderAccount.getAccountNumber(), receiverAccount.getAccountNumber()))
+                .build());
+
+        auditService.log(AuditLog.AuditAction.TRANSFER_CREATED, userEmail,
+                "Transfer", transfer.getId().toString(),
+                String.format("Self-transfer: %.3f TND from %s to %s", amount,
+                        senderAccount.getAccountNumber(), receiverAccount.getAccountNumber()));
+
+        log.info("{}: Self-transfer completed: {} -> {} : {} TND",
+                BEAN_NAME, senderAccount.getAccountNumber(),
+                receiverAccount.getAccountNumber(), amount);
+
+        return toResponse(transfer);
+    }
+
+    // ============================================================
     // Execute Transfer
     // ============================================================
     @Transactional
@@ -72,6 +168,9 @@ public class TransferService {
         // 2. Load sender user
         User sender = userRepository.findByEmail(userEmail)
                 .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
+
+        // 2b. Verify 2FA if enabled (GAP-2: 2FA before transfer)
+        verify2faForTransfer(sender, request.getTotpCode());
 
         // 3. Load and validate sender account with pessimistic lock
         Account senderAccount = accountRepository.findByIdForUpdate(request.getSenderAccountId())
@@ -128,6 +227,11 @@ public class TransferService {
 
         // 17. Fraud analysis (fix #10)
         fraudService.analyzeTransfer(transfer, sender);
+
+        // 18. GAP-23: Email confirmation
+        emailService.sendTransferConfirmation(sender.getEmail(),
+                senderAccount.getAccountNumber(), receiverAccount.getAccountNumber(),
+                String.format("%.3f", amount), transfer.getReferenceNumber());
 
         log.info("{}: Transfer completed: {} -> {} : {} TND",
                 BEAN_NAME, senderAccount.getAccountNumber(),
@@ -199,6 +303,338 @@ public class TransferService {
         }
 
         return toResponse(transfer);
+    }
+
+    // ============================================================
+    // GAP-4: Create Scheduled (one-time future) Transfer
+    // ============================================================
+    @Transactional
+    public TransferResponse createScheduledTransfer(String userEmail, ScheduledTransferRequest request) {
+        log.info("Creating scheduled transfer for user: {}", userEmail);
+
+        if (request.getScheduledAt() == null) {
+            throw new BankingException("La date d'exécution est obligatoire pour un virement programmé");
+        }
+        if (request.getScheduledAt().isBefore(LocalDateTime.now().plusMinutes(5))) {
+            throw new BankingException("La date d'exécution doit être dans le futur (minimum 5 minutes)");
+        }
+
+        validateTransferAmount(request.getAmount());
+
+        User sender = userRepository.findByEmail(userEmail)
+                .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
+
+        verify2faForTransfer(sender, request.getTotpCode());
+
+        Account senderAccount = accountRepository.findById(request.getSenderAccountId())
+                .orElseThrow(() -> new NotFoundException("Compte émetteur introuvable"));
+        verifyAccountOwnership(senderAccount, sender);
+        verifyAccountOperational(senderAccount, "émetteur");
+
+        Account receiverAccount = accountRepository.findByAccountNumber(request.getReceiverAccountNumber())
+                .orElseThrow(() -> new NotFoundException("Compte destinataire introuvable: " + request.getReceiverAccountNumber()));
+        verifyAccountOperational(receiverAccount, "destinataire");
+        verifyNotSameAccount(senderAccount, receiverAccount);
+        verifySameCurrency(senderAccount, receiverAccount);
+
+        Transfer transfer = Transfer.builder()
+                .senderUser(sender)
+                .senderAccount(senderAccount)
+                .receiverAccount(receiverAccount)
+                .receiverName(receiverAccount.getUser().getFullNameFr())
+                .amount(request.getAmount())
+                .motif(sanitizeMotif(request.getMotif()))
+                .referenceNumber(generateReferenceNumber())
+                .status(Transfer.TransferStatus.PENDING)
+                .isRecurring(false)
+                .scheduledAt(request.getScheduledAt())
+                .build();
+        transferRepository.save(transfer);
+
+        notificationRepository.save(Notification.builder()
+                .user(sender).type(Notification.NotificationType.TRANSFER)
+                .title("Virement programmé créé")
+                .body(String.format("Virement de %.3f TND vers %s programmé pour le %s.",
+                        request.getAmount(), receiverAccount.getUser().getFullNameFr(),
+                        request.getScheduledAt().toLocalDate()))
+                .build());
+
+        auditService.log(AuditLog.AuditAction.TRANSFER_CREATED, userEmail,
+                "Transfer", transfer.getId().toString(),
+                "Scheduled transfer for " + request.getScheduledAt());
+
+        return toResponse(transfer);
+    }
+
+    // ============================================================
+    // GAP-4: Create Recurring (permanent) Transfer
+    // ============================================================
+    @Transactional
+    public TransferResponse createRecurringTransfer(String userEmail, ScheduledTransferRequest request) {
+        log.info("Creating recurring transfer for user: {}", userEmail);
+
+        if (request.getRecurrenceIntervalMonths() == null) {
+            throw new BankingException("L'intervalle de récurrence est obligatoire pour un virement permanent");
+        }
+
+        validateTransferAmount(request.getAmount());
+
+        User sender = userRepository.findByEmail(userEmail)
+                .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
+
+        verify2faForTransfer(sender, request.getTotpCode());
+
+        Account senderAccount = accountRepository.findById(request.getSenderAccountId())
+                .orElseThrow(() -> new NotFoundException("Compte émetteur introuvable"));
+        verifyAccountOwnership(senderAccount, sender);
+        verifyAccountOperational(senderAccount, "émetteur");
+
+        Account receiverAccount = accountRepository.findByAccountNumber(request.getReceiverAccountNumber())
+                .orElseThrow(() -> new NotFoundException("Compte destinataire introuvable: " + request.getReceiverAccountNumber()));
+        verifyAccountOperational(receiverAccount, "destinataire");
+        verifyNotSameAccount(senderAccount, receiverAccount);
+        verifySameCurrency(senderAccount, receiverAccount);
+
+        // Calculate first execution date
+        LocalDateTime firstExecution = request.getScheduledAt() != null
+                ? request.getScheduledAt()
+                : LocalDateTime.now().plusMonths(request.getRecurrenceIntervalMonths());
+
+        Transfer transfer = Transfer.builder()
+                .senderUser(sender)
+                .senderAccount(senderAccount)
+                .receiverAccount(receiverAccount)
+                .receiverName(receiverAccount.getUser().getFullNameFr())
+                .amount(request.getAmount())
+                .motif(sanitizeMotif(request.getMotif()))
+                .referenceNumber(generateReferenceNumber())
+                .status(Transfer.TransferStatus.PENDING)
+                .isRecurring(true)
+                .recurrenceRule("MONTHLY_" + request.getRecurrenceIntervalMonths())
+                .scheduledAt(firstExecution)
+                .build();
+        transferRepository.save(transfer);
+
+        notificationRepository.save(Notification.builder()
+                .user(sender).type(Notification.NotificationType.TRANSFER)
+                .title("Virement permanent créé ✅")
+                .body(String.format("Virement permanent de %.3f TND vers %s tous les %d mois. Prochaine exécution: %s.",
+                        request.getAmount(), receiverAccount.getUser().getFullNameFr(),
+                        request.getRecurrenceIntervalMonths(), firstExecution.toLocalDate()))
+                .build());
+
+        auditService.log(AuditLog.AuditAction.TRANSFER_CREATED, userEmail,
+                "Transfer", transfer.getId().toString(),
+                "Recurring transfer every " + request.getRecurrenceIntervalMonths() + " months");
+
+        return toResponse(transfer);
+    }
+
+    // ============================================================
+    // GAP-4: List scheduled/recurring transfers
+    // ============================================================
+    @Transactional(readOnly = true)
+    public Page<TransferResponse> getScheduledTransfers(String userEmail, int page, int size) {
+        User user = userRepository.findByEmail(userEmail)
+                .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
+        return transferRepository.findScheduledByUserId(user.getId(), PageRequest.of(page, size))
+                .map(this::toResponse);
+    }
+
+    // ============================================================
+    // GAP-4: Cancel a scheduled/recurring transfer
+    // ============================================================
+    @Transactional
+    public TransferResponse cancelScheduledTransfer(String userEmail, UUID transferId) {
+        User user = userRepository.findByEmail(userEmail)
+                .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
+
+        Transfer transfer = transferRepository.findById(transferId)
+                .orElseThrow(() -> new NotFoundException("Virement introuvable"));
+
+        if (!transfer.getSenderUser().getId().equals(user.getId())) {
+            throw new ForbiddenException("Ce virement ne vous appartient pas");
+        }
+
+        if (transfer.getStatus() != Transfer.TransferStatus.PENDING) {
+            throw new BankingException("Seuls les virements en attente peuvent être annulés (statut actuel: " + transfer.getStatus() + ")");
+        }
+
+        transfer.setStatus(Transfer.TransferStatus.CANCELLED);
+        transferRepository.save(transfer);
+
+        notificationRepository.save(Notification.builder()
+                .user(user).type(Notification.NotificationType.TRANSFER)
+                .title("Virement annulé")
+                .body(String.format("Votre virement %s de %.3f TND vers %s a été annulé.",
+                        transfer.getIsRecurring() ? "permanent" : "programmé",
+                        transfer.getAmount(), transfer.getReceiverAccount().getAccountNumber()))
+                .build());
+
+        auditService.log(AuditLog.AuditAction.TRANSFER_FAILED, userEmail,
+                "Transfer", transfer.getId().toString(), "Scheduled/recurring transfer cancelled");
+
+        return toResponse(transfer);
+    }
+
+    // ============================================================
+    // GAP-3: Batch (Grouped) Transfer
+    // ============================================================
+    @Transactional
+    public BatchTransferResponse createBatchTransfer(String userEmail, BatchTransferRequest request) {
+        log.info("Creating batch transfer with {} items for user: {}", request.getItems().size(), userEmail);
+
+        User sender = userRepository.findByEmail(userEmail)
+                .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
+
+        verify2faForTransfer(sender, request.getTotpCode());
+
+        Account senderAccount = accountRepository.findByIdForUpdate(request.getSenderAccountId())
+                .orElseThrow(() -> new NotFoundException("Compte émetteur introuvable"));
+        verifyAccountOwnership(senderAccount, sender);
+        verifyAccountOperational(senderAccount, "émetteur");
+
+        // Calculate total amount
+        BigDecimal totalAmount = request.getItems().stream()
+                .map(BatchTransferRequest.BatchItem::getAmount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        // Verify total sufficient balance
+        verifySufficientBalance(senderAccount, totalAmount);
+
+        // Verify daily limit for total
+        verifyDailyLimit(sender.getId(), totalAmount);
+
+        // Create batch record
+        BatchTransfer batch = BatchTransfer.builder()
+                .user(sender)
+                .senderAccount(senderAccount)
+                .totalAmount(totalAmount)
+                .totalCount(request.getItems().size())
+                .successCount(0)
+                .failedCount(0)
+                .status(BatchTransfer.BatchStatus.PROCESSING)
+                .build();
+        batchTransferRepository.save(batch);
+
+        int successCount = 0;
+        int failedCount = 0;
+
+        for (BatchTransferRequest.BatchItem item : request.getItems()) {
+            BatchTransferItem batchItem = BatchTransferItem.builder()
+                    .batchTransfer(batch)
+                    .receiverAccountNumber(item.getReceiverAccountNumber())
+                    .amount(item.getAmount())
+                    .motif(sanitizeMotif(item.getMotif()))
+                    .status(BatchTransferItem.ItemStatus.PENDING)
+                    .build();
+
+            try {
+                // Validate each item
+                validateTransferAmount(item.getAmount());
+
+                Account receiverAccount = accountRepository.findByAccountNumberForUpdate(item.getReceiverAccountNumber())
+                        .orElseThrow(() -> new NotFoundException("Compte destinataire introuvable: " + item.getReceiverAccountNumber()));
+                verifyAccountOperational(receiverAccount, "destinataire");
+                verifyNotSameAccount(senderAccount, receiverAccount);
+                verifySameCurrency(senderAccount, receiverAccount);
+
+                // Re-check balance before each item
+                if (senderAccount.getBalance().compareTo(item.getAmount()) < 0) {
+                    throw new InsufficientFundsException("Solde insuffisant pour ce sous-virement");
+                }
+
+                // Execute transfer
+                senderAccount.setBalance(senderAccount.getBalance().subtract(item.getAmount()));
+                accountRepository.save(senderAccount);
+                receiverAccount.setBalance(receiverAccount.getBalance().add(item.getAmount()));
+                accountRepository.save(receiverAccount);
+
+                Transfer transfer = Transfer.builder()
+                        .senderUser(sender)
+                        .senderAccount(senderAccount)
+                        .receiverAccount(receiverAccount)
+                        .receiverName(receiverAccount.getUser().getFullNameFr())
+                        .amount(item.getAmount())
+                        .motif(sanitizeMotif(item.getMotif()))
+                        .referenceNumber(generateReferenceNumber())
+                        .status(Transfer.TransferStatus.EXECUTED)
+                        .executedAt(LocalDateTime.now())
+                        .build();
+                transferRepository.save(transfer);
+
+                createTransactions(senderAccount, receiverAccount, transfer, item.getAmount());
+
+                batchItem.setStatus(BatchTransferItem.ItemStatus.EXECUTED);
+                batchItem.setTransfer(transfer);
+                successCount++;
+
+            } catch (Exception e) {
+                batchItem.setStatus(BatchTransferItem.ItemStatus.FAILED);
+                batchItem.setErrorMessage(e.getMessage());
+                failedCount++;
+                log.warn("Batch item failed for receiver {}: {}", item.getReceiverAccountNumber(), e.getMessage());
+            }
+
+            batchTransferItemRepository.save(batchItem);
+        }
+
+        // Update batch status
+        batch.setSuccessCount(successCount);
+        batch.setFailedCount(failedCount);
+        batch.setCompletedAt(LocalDateTime.now());
+
+        if (failedCount == 0) {
+            batch.setStatus(BatchTransfer.BatchStatus.COMPLETED);
+        } else if (successCount == 0) {
+            batch.setStatus(BatchTransfer.BatchStatus.FAILED);
+        } else {
+            batch.setStatus(BatchTransfer.BatchStatus.PARTIAL);
+        }
+        batchTransferRepository.save(batch);
+
+        // Notification
+        notificationRepository.save(Notification.builder()
+                .user(sender).type(Notification.NotificationType.TRANSFER)
+                .title("Virement groupé terminé")
+                .body(String.format("Lot de %d virements: %d réussis, %d échoués. Total: %.3f TND.",
+                        batch.getTotalCount(), successCount, failedCount, totalAmount))
+                .build());
+
+        auditService.log(AuditLog.AuditAction.TRANSFER_CREATED, userEmail,
+                "BatchTransfer", batch.getId().toString(),
+                String.format("Batch: %d items, %d success, %d failed", batch.getTotalCount(), successCount, failedCount));
+
+        return toBatchResponse(batch);
+    }
+
+    // ============================================================
+    // GAP-3: Get Batch Transfer Details
+    // ============================================================
+    @Transactional(readOnly = true)
+    public BatchTransferResponse getBatchTransferById(String userEmail, UUID batchId) {
+        User user = userRepository.findByEmail(userEmail)
+                .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
+
+        BatchTransfer batch = batchTransferRepository.findById(batchId)
+                .orElseThrow(() -> new NotFoundException("Lot de virements introuvable"));
+
+        if (!batch.getUser().getId().equals(user.getId())) {
+            throw new ForbiddenException("Ce lot de virements ne vous appartient pas");
+        }
+
+        return toBatchResponse(batch);
+    }
+
+    // ============================================================
+    // GAP-3: List my batch transfers
+    // ============================================================
+    @Transactional(readOnly = true)
+    public Page<BatchTransferResponse> getMyBatchTransfers(String userEmail, int page, int size) {
+        User user = userRepository.findByEmail(userEmail)
+                .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
+        return batchTransferRepository.findByUserIdOrderByCreatedAtDesc(user.getId(), PageRequest.of(page, size))
+                .map(this::toBatchResponse);
     }
 
     // ============================================================
@@ -284,6 +720,7 @@ public class TransferService {
                 .receiverName(receiverAccount.getUser().getFullNameFr())
                 .amount(amount)
                 .motif(sanitizeMotif(request.getMotif()))
+                .referenceNumber(generateReferenceNumber())
                 .status(Transfer.TransferStatus.EXECUTED)
                 .executedAt(LocalDateTime.now())
                 .build();
@@ -328,9 +765,44 @@ public class TransferService {
         return motif.replaceAll("[<>\"'&]", "");
     }
 
+    /** GAP-12: Generate a human-readable reference number for transfer receipts */
+    private String generateReferenceNumber() {
+        String date = LocalDate.now().toString().replace("-", "");
+        String seq = String.format("%05d",
+                Math.abs(UUID.randomUUID().getLeastSignificantBits() % 100_000));
+        return "VIR-" + date + "-" + seq;
+    }
+
+    /** GAP-2: Verify 2FA TOTP code before executing a transfer */
+    private void verify2faForTransfer(User user, String totpCode) {
+        if (!Boolean.TRUE.equals(user.getIs2faEnabled())) {
+            return; // 2FA not enabled — skip
+        }
+        if (totpCode == null || totpCode.isBlank()) {
+            throw new BankingException("Code 2FA requis pour effectuer un virement (votre compte a le 2FA activé)");
+        }
+        if (user.getTotpSecret() == null) {
+            throw new BankingException("Configuration 2FA incomplète. Veuillez reconfigurer le 2FA.");
+        }
+        CodeVerifier verifier = new DefaultCodeVerifier(
+                new DefaultCodeGenerator(), new SystemTimeProvider());
+        if (!verifier.isValidCode(user.getTotpSecret(), totpCode)) {
+            throw new BankingException("Code 2FA invalide. Virement refusé.");
+        }
+    }
+
     private TransferResponse toResponse(Transfer t) {
+        // Parse recurrence interval from recurrenceRule if present
+        Integer recurrenceMonths = null;
+        if (t.getRecurrenceRule() != null && t.getRecurrenceRule().startsWith("MONTHLY_")) {
+            try {
+                recurrenceMonths = Integer.parseInt(t.getRecurrenceRule().replace("MONTHLY_", ""));
+            } catch (NumberFormatException ignored) {}
+        }
+
         return TransferResponse.builder()
                 .id(t.getId())
+                .referenceNumber(t.getReferenceNumber())
                 .senderAccountId(t.getSenderAccount().getId())
                 .senderAccountNumber(t.getSenderAccount().getAccountNumber())
                 .receiverAccountId(t.getReceiverAccount().getId())
@@ -340,8 +812,40 @@ public class TransferService {
                 .currency(t.getCurrency())
                 .motif(t.getMotif())
                 .status(t.getStatus().name())
+                .isRecurring(t.getIsRecurring())
+                .recurrenceIntervalMonths(recurrenceMonths)
+                .scheduledAt(t.getScheduledAt())
                 .executedAt(t.getExecutedAt())
                 .createdAt(t.getCreatedAt())
+                .build();
+    }
+
+    private BatchTransferResponse toBatchResponse(BatchTransfer batch) {
+        List<BatchTransferResponse.BatchItemResponse> itemResponses =
+                batchTransferItemRepository.findByBatchTransferId(batch.getId()).stream()
+                        .map(item -> BatchTransferResponse.BatchItemResponse.builder()
+                                .id(item.getId())
+                                .receiverAccountNumber(item.getReceiverAccountNumber())
+                                .amount(item.getAmount())
+                                .motif(item.getMotif())
+                                .status(item.getStatus().name())
+                                .errorMessage(item.getErrorMessage())
+                                .transferId(item.getTransfer() != null ? item.getTransfer().getId() : null)
+                                .build())
+                        .toList();
+
+        return BatchTransferResponse.builder()
+                .id(batch.getId())
+                .senderAccountId(batch.getSenderAccount().getId())
+                .senderAccountNumber(batch.getSenderAccount().getAccountNumber())
+                .totalAmount(batch.getTotalAmount())
+                .totalCount(batch.getTotalCount())
+                .successCount(batch.getSuccessCount())
+                .failedCount(batch.getFailedCount())
+                .status(batch.getStatus().name())
+                .createdAt(batch.getCreatedAt())
+                .completedAt(batch.getCompletedAt())
+                .items(itemResponses)
                 .build();
     }
 }

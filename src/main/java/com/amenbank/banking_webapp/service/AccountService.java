@@ -11,6 +11,7 @@ import com.amenbank.banking_webapp.repository.TransactionRepository;
 import com.amenbank.banking_webapp.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -76,6 +77,27 @@ public class AccountService {
         return transactionRepository
                 .findByAccountIdAndCreatedAtBetweenOrderByCreatedAtDesc(accountId, from, to, PageRequest.of(page, size))
                 .stream().map(this::toTransactionResponse).collect(Collectors.toList());
+    }
+
+    // ============================================================
+    // GAP-1: Advanced transaction search (amount, type, category, date)
+    // ============================================================
+    @Transactional(readOnly = true)
+    public Page<TransactionResponse> searchTransactions(
+            UUID accountId, String email,
+            LocalDateTime from, LocalDateTime to,
+            BigDecimal minAmount, BigDecimal maxAmount,
+            Transaction.TransactionType type, String category,
+            int page, int size) {
+        Account account = accountRepository.findById(accountId)
+                .orElseThrow(() -> new BankingException.NotFoundException("Account not found"));
+        if (!account.getUser().getEmail().equals(email)) {
+            throw new BankingException.ForbiddenException("Access denied");
+        }
+        return transactionRepository.searchTransactions(
+                accountId, from, to, minAmount, maxAmount, type, category,
+                PageRequest.of(page, size))
+                .map(this::toTransactionResponse);
     }
 
     // ============================================================

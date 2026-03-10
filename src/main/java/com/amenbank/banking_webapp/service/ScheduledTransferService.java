@@ -102,6 +102,19 @@ public class ScheduledTransferService {
 
                 // Update template with next scheduled time
                 template.setExecutedAt(LocalDateTime.now());
+                // Calculate next execution date from recurrence rule
+                if (template.getRecurrenceRule() != null && template.getRecurrenceRule().startsWith("MONTHLY_")) {
+                    try {
+                        int intervalMonths = Integer.parseInt(template.getRecurrenceRule().replace("MONTHLY_", ""));
+                        template.setScheduledAt(LocalDateTime.now().plusMonths(intervalMonths));
+                    } catch (NumberFormatException e) {
+                        // Fallback: schedule next month
+                        template.setScheduledAt(LocalDateTime.now().plusMonths(1));
+                    }
+                } else {
+                    // Fallback for legacy: schedule next month
+                    template.setScheduledAt(LocalDateTime.now().plusMonths(1));
+                }
                 // Keep as PENDING for next recurrence
                 transferRepository.save(template);
 
@@ -174,6 +187,36 @@ public class ScheduledTransferService {
                 .balanceAfter(receiver.getBalance())
                 .description("Virement reçu de " + sender.getAccountNumber())
                 .category("virement").build());
+    }
+
+    /**
+     * GAP-5: Pre-notification for recurring transfers — runs every 6 hours.
+     * Notifies users 24h before a recurring transfer is due.
+     */
+    @Scheduled(fixedRate = 21_600_000) // every 6 hours
+    @Transactional
+    public void notifyUpcomingRecurringTransfers() {
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime in24h = now.plusHours(24);
+
+        List<Transfer> upcoming = transferRepository.findRecurringTransfersDueSoon(now, in24h);
+        if (upcoming.isEmpty()) return;
+
+        log.info("Sending pre-notifications for {} upcoming recurring transfers", upcoming.size());
+
+        for (Transfer transfer : upcoming) {
+            notificationRepository.save(Notification.builder()
+                    .user(transfer.getSenderUser())
+                    .type(Notification.NotificationType.TRANSFER)
+                    .title("⏰ Virement permanent prévu demain")
+                    .body(String.format(
+                            "Votre virement permanent de %.3f TND vers %s sera exécuté le %s. " +
+                            "Vous pouvez l'annuler depuis l'espace virements programmés.",
+                            transfer.getAmount(),
+                            transfer.getReceiverAccount().getAccountNumber(),
+                            transfer.getScheduledAt().toLocalDate()))
+                    .build());
+        }
     }
 }
 

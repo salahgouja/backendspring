@@ -20,4 +20,6 @@ public class CreditSimulationRequest {
     @Min(value = 6, message = "La durée minimum est de 6 mois")
     @Max(value = 360, message = "La durée maximum est de 360 mois (30 ans)")
     private Integer durationMonths;
+
+    private String purpose; // Justification / motif de la demande
 }

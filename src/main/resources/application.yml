@@ -35,6 +35,13 @@ spring:
         format_sql: true
     open-in-view: false
 
+  # ── File Upload ──────────────────────────────────────
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: 10MB
+      max-request-size: 50MB
+
   # ── Redis ────────────────────────────────────────────
   data:
     redis:
@@ -45,6 +52,22 @@ spring:
   cache:
     type: simple
     cache-names: userCache,tokenCache,accountCache,transactionCache,notificationCache
+
+  # ── Email (GAP-23 — disabled by default for dev) ────
+  mail:
+    host: ${MAIL_HOST:smtp.gmail.com}
+    port: ${MAIL_PORT:587}
+    username: ${MAIL_USERNAME:noreply@amenbank.com.tn}
+    password: ${MAIL_PASSWORD:}
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enabled: true
+            required: true
+          ssl:
+            trust: smtp.gmail.com
 
 # ── JWT Configuration ──────────────────────────────────
 jwt:
@@ -64,6 +87,10 @@ app:
     unusual-amount-threshold: ${FRAUD_AMOUNT_THRESHOLD:50000.000}
     velocity-window-minutes: ${FRAUD_VELOCITY_WINDOW:30}
     velocity-max-count: ${FRAUD_VELOCITY_MAX:5}
+  upload:
+    credit-documents-dir: ${CREDIT_DOCS_DIR:./uploads/credit-documents}
+  email:
+    enabled: ${EMAIL_ENABLED:false}
 
 # ── CORS (allow React frontend) ───────────────────────
 cors:

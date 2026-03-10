@@ -19,6 +19,7 @@ public class CreditResponse {
     private BigDecimal totalCost; // Total repayment = monthlyPayment × duration
     private BigDecimal totalInterest; // Total interest = totalCost - amountRequested
     private String status;
+    private String purpose;
     private Double aiRiskScore;
     private LocalDateTime createdAt;
     private LocalDateTime decidedAt;

@@ -61,6 +61,8 @@ public class AuthService {
     private final AuthenticationManager authenticationManager;
     private final AuditService auditService;
     private final UserDetailsServiceImpl userDetailsService;
+    private final com.amenbank.banking_webapp.repository.PasswordResetTokenRepository passwordResetTokenRepository;
+    private final EmailService emailService;
 
     @Value("${app.security.min-password-length:8}")
     private int minPasswordLength;
@@ -563,5 +565,124 @@ public class AuthService {
                 .createdAt(user.getCreatedAt())
                 .updatedAt(user.getUpdatedAt())
                 .build();
+    }
+
+    // ============================================================
+    // GAP-13: Forgot Password (send OTP)
+    // ============================================================
+    @Transactional
+    public Map<String, String> forgotPassword(String email) {
+        User user = userRepository.findByEmail(email).orElse(null);
+
+        // Always return success to prevent email enumeration attacks
+        if (user == null) {
+            log.warn("{}: Forgot password attempt for non-existent email: {}", BEAN_NAME, email);
+            return Map.of("message",
+                    "Si cette adresse email est enregistrée, un code de réinitialisation a été envoyé.");
+        }
+
+        if (!Boolean.TRUE.equals(user.getIsActive())) {
+            log.warn("{}: Forgot password for inactive user: {}", BEAN_NAME, email);
+            return Map.of("message",
+                    "Si cette adresse email est enregistrée, un code de réinitialisation a été envoyé.");
+        }
+
+        // Generate 6-digit OTP
+        String otpCode = String.format("%06d", new java.util.Random().nextInt(999999));
+
+        // Expire old tokens
+        passwordResetTokenRepository.findActiveTokenByEmail(email, LocalDateTime.now())
+                .ifPresent(token -> {
+                    token.setIsUsed(true);
+                    passwordResetTokenRepository.save(token);
+                });
+
+        // Create new token (expires in 15 minutes)
+        com.amenbank.banking_webapp.model.PasswordResetToken resetToken =
+                com.amenbank.banking_webapp.model.PasswordResetToken.builder()
+                        .user(user)
+                        .otpCode(otpCode)
+                        .expiresAt(LocalDateTime.now().plusMinutes(15))
+                        .build();
+        passwordResetTokenRepository.save(resetToken);
+
+        // In-app notification with OTP (in production, this would be sent via email/SMS)
+        notificationRepository.save(Notification.builder()
+                .user(user)
+                .type(Notification.NotificationType.SECURITY)
+                .title("Code de réinitialisation du mot de passe")
+                .body(String.format("Votre code OTP est: %s. Ce code expire dans 15 minutes. " +
+                        "Ne partagez jamais ce code avec personne.", otpCode))
+                .build());
+
+        // GAP-23: Send OTP via email
+        emailService.sendPasswordResetOtp(user.getEmail(), otpCode);
+
+        auditService.log(AuditLog.AuditAction.PASSWORD_CHANGED, email,
+                "User", user.getId().toString(), "Password reset OTP requested");
+
+        log.info("{}: Password reset OTP generated for user: {}", BEAN_NAME, email);
+
+        return Map.of(
+                "message", "Si cette adresse email est enregistrée, un code de réinitialisation a été envoyé.",
+                "otpCode", otpCode // REMOVE IN PRODUCTION — only for dev/testing via Swagger
+        );
+    }
+
+    // ============================================================
+    // GAP-13: Reset Password (verify OTP + set new password)
+    // ============================================================
+    @Transactional
+    public Map<String, String> resetPassword(String email, String otpCode, String newPassword) {
+        // Validate password strength
+        if (!PASSWORD_PATTERN.matcher(newPassword).matches()) {
+            throw new BankingException(
+                    "Le mot de passe doit contenir au moins 8 caractères: majuscule, minuscule, chiffre, caractère spécial");
+        }
+
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new BankingException("Code OTP invalide ou expiré"));
+
+        // Find valid token
+        com.amenbank.banking_webapp.model.PasswordResetToken token = passwordResetTokenRepository
+                .findActiveTokenByEmail(email, LocalDateTime.now())
+                .orElseThrow(() -> new BankingException("Code OTP invalide ou expiré"));
+
+        if (!token.getOtpCode().equals(otpCode)) {
+            throw new BankingException("Code OTP invalide ou expiré");
+        }
+
+        if (token.isExpired()) {
+            throw new BankingException("Code OTP expiré. Veuillez en demander un nouveau.");
+        }
+
+        // Reset password
+        user.setHashedPassword(passwordEncoder.encode(newPassword));
+        user.setFailedLoginAttempts(0);
+        user.setLockUntil(null);
+        userRepository.save(user);
+
+        // Invalidate the token
+        token.setIsUsed(true);
+        passwordResetTokenRepository.save(token);
+
+        // Invalidate cached user details
+        userDetailsService.invalidateCache(email);
+
+        // Notify
+        notificationRepository.save(Notification.builder()
+                .user(user)
+                .type(Notification.NotificationType.SECURITY)
+                .title("Mot de passe réinitialisé ✅")
+                .body("Votre mot de passe a été réinitialisé avec succès. " +
+                        "Si vous n'êtes pas à l'origine de cette action, contactez votre agence immédiatement.")
+                .build());
+
+        auditService.log(AuditLog.AuditAction.PASSWORD_CHANGED, email,
+                "User", user.getId().toString(), "Password reset via OTP");
+
+        log.info("{}: Password reset successfully for user: {}", BEAN_NAME, email);
+
+        return Map.of("message", "Mot de passe réinitialisé avec succès. Vous pouvez maintenant vous connecter.");
     }
 }

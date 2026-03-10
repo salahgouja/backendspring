@@ -2,9 +2,14 @@ package com.amenbank.banking_webapp.config;
 
 import com.amenbank.banking_webapp.model.Account;
 import com.amenbank.banking_webapp.model.Agency;
+import com.amenbank.banking_webapp.model.CreditRequest;
+import com.amenbank.banking_webapp.model.LoanProduct;
+import com.amenbank.banking_webapp.model.ReferenceRate;
 import com.amenbank.banking_webapp.model.User;
 import com.amenbank.banking_webapp.repository.AccountRepository;
 import com.amenbank.banking_webapp.repository.AgencyRepository;
+import com.amenbank.banking_webapp.repository.LoanProductRepository;
+import com.amenbank.banking_webapp.repository.ReferenceRateRepository;
 import com.amenbank.banking_webapp.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -28,6 +33,8 @@ public class DataLoader implements CommandLineRunner {
         private final UserRepository userRepository;
         private final AccountRepository accountRepository;
         private final AgencyRepository agencyRepository;
+        private final ReferenceRateRepository referenceRateRepository;
+        private final LoanProductRepository loanProductRepository;
         private final PasswordEncoder passwordEncoder;
 
         @Override
@@ -57,9 +64,12 @@ public class DataLoader implements CommandLineRunner {
                                 User.UserType.PARTICULIER, new BigDecimal("5000.000"),
                                 "Tunis-Lafayette");
 
-                seedUser("fatma.chaari@gmail.com", "55000002", "Test1234!",
-                                "فاطمة الشعري", "Fatma Chaari", "08000002",
-                                User.UserType.PARTICULIER, new BigDecimal("3500.000"),
+                // ── GAP-11: Give Mohamed Mejri a 2nd account (EPARGNE) for self-transfer testing ──
+                seedSecondAccount("mohamed.mejri@gmail.com", Account.AccountType.EPARGNE, new BigDecimal("2000.000"));
+
+                seedUser("salahgouja2001@gmail.com", "92929292", "Test1234!",
+                                "صالح قوجة", "Salah Gouja", "08000002",
+                                User.UserType.PARTICULIER, new BigDecimal("13500.000"),
                                 "Tunis-Lafayette");
 
                 // COMMERCANT x2 — linked to an agency
@@ -74,6 +84,14 @@ public class DataLoader implements CommandLineRunner {
                                 "Medenine-Houmt Souk (Djerba)");
 
                 log.info("DataLoader finished — agencies + 7 seed users verified.");
+
+                // ── 3. Seed Reference Rates (TMM history) ─────────────
+                seedReferenceRates();
+
+                // ── 4. Seed Loan Products ─────────────────────────────
+                seedLoanProducts();
+
+                log.info("DataLoader finished — full bank data seeded.");
         }
 
         // ============================================================
@@ -201,5 +219,155 @@ public class DataLoader implements CommandLineRunner {
         private String generateAccountNumber() {
                 return "AMEN" + String.format("%012d",
                                 Math.abs(UUID.randomUUID().getLeastSignificantBits() % 1_000_000_000_000L));
+        }
+
+        // ============================================================
+        // Seed TMM Reference Rates (BCT historical data)
+        // ============================================================
+        private void seedReferenceRates() {
+                if (referenceRateRepository.count() > 0) {
+                        log.info("Reference rates already seeded ({} found)", referenceRateRepository.count());
+                        return;
+                }
+
+                // Historical TMM rates (Taux du Marché Monétaire — BCT)
+                List.of(
+                        new Object[]{"TMM", "7.0000", "2023-01-01", "BCT"},
+                        new Object[]{"TMM", "7.5000", "2023-06-01", "BCT"},
+                        new Object[]{"TMM", "8.0000", "2024-01-15", "BCT"},
+                        new Object[]{"TMM", "7.7500", "2024-07-01", "BCT"},
+                        new Object[]{"TMM", "8.0000", "2025-01-01", "BCT"},
+                        new Object[]{"TMM", "7.9700", "2025-09-01", "BCT"},
+                        new Object[]{"TMM", "8.0000", "2026-01-01", "BCT"}
+                ).forEach(r -> {
+                        referenceRateRepository.save(ReferenceRate.builder()
+                                .indexName((String) r[0])
+                                .rateValue(new BigDecimal((String) r[1]))
+                                .effectiveDate(java.time.LocalDate.parse((String) r[2]))
+                                .source((String) r[3])
+                                .build());
+                });
+
+                log.info("Seeded 7 TMM historical reference rates");
+        }
+
+        // ============================================================
+        // Seed Loan Products
+        // ============================================================
+        private void seedLoanProducts() {
+                if (loanProductRepository.count() > 0) {
+                        log.info("Loan products already seeded ({} found)", loanProductRepository.count());
+                        return;
+                }
+
+                // 1. Crédit Personnel — Variable (TMM + 3%)
+                loanProductRepository.save(LoanProduct.builder()
+                        .name("Crédit Personnel").code("CRED-PERSO")
+                        .creditType(CreditRequest.CreditType.PERSONNEL)
+                        .rateType(LoanProduct.RateType.VARIABLE)
+                        .referenceIndex("TMM").margin(new BigDecimal("3.00"))
+                        .floorRate(new BigDecimal("5.00")).ceilingRate(new BigDecimal("15.00"))
+                        .dayCountConvention(LoanProduct.DayCountConvention.ACTUAL_360)
+                        .repaymentFrequency(LoanProduct.RepaymentFrequency.MONTHLY)
+                        .interestMethod(LoanProduct.InterestMethod.AMORTIZED)
+                        .minAmount(new BigDecimal("1000.000")).maxAmount(new BigDecimal("100000.000"))
+                        .minDurationMonths(6).maxDurationMonths(84)
+                        .maxGracePeriodMonths(3).penaltyMargin(new BigDecimal("2.00"))
+                        .build());
+
+                // 2. Crédit Immobilier — Variable (TMM + 1.75%)
+                loanProductRepository.save(LoanProduct.builder()
+                        .name("Crédit Immobilier").code("CRED-IMMO")
+                        .creditType(CreditRequest.CreditType.IMMOBILIER)
+                        .rateType(LoanProduct.RateType.VARIABLE)
+                        .referenceIndex("TMM").margin(new BigDecimal("1.75"))
+                        .floorRate(new BigDecimal("4.00")).ceilingRate(new BigDecimal("12.00"))
+                        .dayCountConvention(LoanProduct.DayCountConvention.ACTUAL_360)
+                        .repaymentFrequency(LoanProduct.RepaymentFrequency.MONTHLY)
+                        .interestMethod(LoanProduct.InterestMethod.AMORTIZED)
+                        .minAmount(new BigDecimal("50000.000")).maxAmount(new BigDecimal("500000.000"))
+                        .minDurationMonths(24).maxDurationMonths(300)
+                        .maxGracePeriodMonths(12).penaltyMargin(new BigDecimal("1.50"))
+                        .build());
+
+                // 3. Crédit Commercial — Variable (TMM + 2.50%)
+                loanProductRepository.save(LoanProduct.builder()
+                        .name("Crédit Commercial").code("CRED-COMM")
+                        .creditType(CreditRequest.CreditType.COMMERCIAL)
+                        .rateType(LoanProduct.RateType.VARIABLE)
+                        .referenceIndex("TMM").margin(new BigDecimal("2.50"))
+                        .floorRate(new BigDecimal("5.00")).ceilingRate(new BigDecimal("14.00"))
+                        .dayCountConvention(LoanProduct.DayCountConvention.THIRTY_360)
+                        .repaymentFrequency(LoanProduct.RepaymentFrequency.MONTHLY)
+                        .interestMethod(LoanProduct.InterestMethod.AMORTIZED)
+                        .minAmount(new BigDecimal("5000.000")).maxAmount(new BigDecimal("200000.000"))
+                        .minDurationMonths(12).maxDurationMonths(60)
+                        .maxGracePeriodMonths(6).penaltyMargin(new BigDecimal("2.00"))
+                        .build());
+
+                // 4. Crédit Équipement — Fixed rate
+                loanProductRepository.save(LoanProduct.builder()
+                        .name("Crédit Équipement").code("CRED-EQUIP")
+                        .creditType(CreditRequest.CreditType.EQUIPEMENT)
+                        .rateType(LoanProduct.RateType.FIXED)
+                        .fixedRate(new BigDecimal("9.50"))
+                        .margin(BigDecimal.ZERO)
+                        .dayCountConvention(LoanProduct.DayCountConvention.ACTUAL_365)
+                        .repaymentFrequency(LoanProduct.RepaymentFrequency.QUARTERLY)
+                        .interestMethod(LoanProduct.InterestMethod.AMORTIZED)
+                        .minAmount(new BigDecimal("10000.000")).maxAmount(new BigDecimal("300000.000"))
+                        .minDurationMonths(12).maxDurationMonths(84)
+                        .maxGracePeriodMonths(6).penaltyMargin(new BigDecimal("2.50"))
+                        .build());
+
+                // 5. Facilité de Caisse (Overdraft / Revolving)
+                loanProductRepository.save(LoanProduct.builder()
+                        .name("Facilité de Caisse").code("FAC-CAISSE")
+                        .creditType(CreditRequest.CreditType.COMMERCIAL)
+                        .rateType(LoanProduct.RateType.VARIABLE)
+                        .referenceIndex("TMM").margin(new BigDecimal("3.50"))
+                        .floorRate(new BigDecimal("6.00")).ceilingRate(new BigDecimal("16.00"))
+                        .dayCountConvention(LoanProduct.DayCountConvention.ACTUAL_360)
+                        .repaymentFrequency(LoanProduct.RepaymentFrequency.MONTHLY)
+                        .interestMethod(LoanProduct.InterestMethod.REVOLVING)
+                        .minAmount(new BigDecimal("5000.000")).maxAmount(new BigDecimal("100000.000"))
+                        .minDurationMonths(1).maxDurationMonths(12)
+                        .maxGracePeriodMonths(0).penaltyMargin(new BigDecimal("3.00"))
+                        .build());
+
+                log.info("Seeded 5 loan products (3 variable + 1 fixed + 1 revolving)");
+        }
+
+        // ============================================================
+        // Seed a second account for an existing user (for self-transfer testing)
+        // ============================================================
+        private void seedSecondAccount(String email, Account.AccountType accountType, BigDecimal balance) {
+                User user = userRepository.findByEmail(email).orElse(null);
+                if (user == null) {
+                        log.warn("Cannot seed second account — user not found: {}", email);
+                        return;
+                }
+
+                // Check if user already has this account type
+                List<Account> existing = accountRepository.findByUserIdAndAccountType(user.getId(), accountType);
+                if (!existing.isEmpty()) {
+                        log.info("User {} already has a {} account: {}",
+                                        email, accountType, existing.get(0).getAccountNumber());
+                        return;
+                }
+
+                Account account = Account.builder()
+                                .user(user)
+                                .accountNumber(generateAccountNumber())
+                                .accountType(accountType)
+                                .balance(balance)
+                                .currency("TND")
+                                .isActive(true)
+                                .status(Account.AccountStatus.ACTIVE)
+                                .build();
+                accountRepository.save(account);
+
+                log.info("Seeded 2nd account for {}: {} ({}) with {} TND",
+                                email, account.getAccountNumber(), accountType, balance);
         }
 }

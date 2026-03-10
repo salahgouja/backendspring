@@ -81,6 +81,13 @@ public class AuditLog {
         USER_DEACTIVATED,
         AGENT_CREATED,
 
+        // Loan Engine
+        LOAN_CREATED,
+        LOAN_PAYMENT,
+        LOAN_RATE_REVISED,
+        LOAN_DEFAULTED,
+        LOAN_PAID_OFF,
+
         // Fraud
         FRAUD_ALERT_CREATED,
         FRAUD_ALERT_RESOLVED

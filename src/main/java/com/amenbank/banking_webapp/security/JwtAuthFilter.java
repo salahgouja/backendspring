@@ -98,9 +98,12 @@ public class JwtAuthFilter extends OncePerRequestFilter {
                         BEAN_NAME, email, requestUri);
             }
 
+        } catch (org.springframework.security.core.userdetails.UsernameNotFoundException e) {
+            // User from JWT no longer exists (e.g. DB was recreated) — not an error, just skip auth
+            log.debug("{}: JWT user not found (DB may have been recreated): {}", BEAN_NAME, e.getMessage());
         } catch (Exception e) {
             log.error("{}: Error processing JWT token for URI: {} - Error: {}", 
-                    BEAN_NAME, requestUri, e.getMessage(), e);
+                    BEAN_NAME, requestUri, e.getMessage());
         } finally {
             long duration = System.currentTimeMillis() - startTime;
             if (duration > 100) {

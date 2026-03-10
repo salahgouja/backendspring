@@ -9,12 +9,14 @@ import com.amenbank.banking_webapp.exception.BankingException.NotFoundException;
 import com.amenbank.banking_webapp.model.*;
 import com.amenbank.banking_webapp.repository.*;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.math.MathContext;
 import java.math.RoundingMode;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
@@ -22,6 +24,7 @@ import java.util.UUID;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class CreditService {
 
         private static final String USER_NOT_FOUND = "Utilisateur introuvable";
@@ -32,7 +35,9 @@ public class CreditService {
         private final UserRepository userRepository;
         private final AccountRepository accountRepository;
         private final TransactionRepository transactionRepository;
+        private final LoanProductRepository loanProductRepository;
         private final AuditService auditService;
+        private final LoanEngineService loanEngineService;
 
         // ── Interest rates by credit type (annual %) ───────────
         private static final Map<CreditRequest.CreditType, BigDecimal> INTEREST_RATES = Map.of(
@@ -58,6 +63,7 @@ public class CreditService {
                                 .monthlyPayment(monthlyPayment)
                                 .totalCost(totalCost.setScale(3, RoundingMode.HALF_UP))
                                 .totalInterest(totalInterest.setScale(3, RoundingMode.HALF_UP))
+                                .purpose(request.getPurpose())
                                 .status(CreditRequest.CreditStatus.SIMULATION.name())
                                 .build();
         }
@@ -79,6 +85,7 @@ public class CreditService {
                                 .durationMonths(request.getDurationMonths())
                                 .interestRate(rate)
                                 .monthlyPayment(monthlyPayment)
+                                .purpose(request.getPurpose() != null ? sanitize(request.getPurpose()) : null)
                                 .status(CreditRequest.CreditStatus.SUBMITTED)
                                 .build();
                 creditRequestRepository.save(credit);
@@ -278,6 +285,38 @@ public class CreditService {
                 credit.setStatus(CreditRequest.CreditStatus.DISBURSED);
                 creditRequestRepository.save(credit);
 
+                // ── GAP-14: Bridge to Loan Engine — Create LoanContract ──
+                try {
+                        LoanProduct matchingProduct = loanProductRepository
+                                        .findByCreditTypeAndIsActiveTrue(credit.getCreditType())
+                                        .stream()
+                                        .findFirst()
+                                        .orElse(null);
+
+                        if (matchingProduct != null) {
+                                LoanContract loan = loanEngineService.createLoan(
+                                                client,
+                                                matchingProduct,
+                                                credit.getAmountRequested(),
+                                                credit.getDurationMonths(),
+                                                LoanContract.GracePeriodType.NONE,
+                                                0,
+                                                LocalDate.now(),
+                                                targetAccount,
+                                                credit);
+
+                                log.info("Loan contract {} created from credit request {}",
+                                                loan.getContractNumber(), credit.getId());
+                        } else {
+                                log.warn("No active loan product found for credit type {}, skipping loan creation",
+                                                credit.getCreditType());
+                        }
+                } catch (Exception e) {
+                        log.error("Failed to create loan contract for credit {}: {}",
+                                        credit.getId(), e.getMessage());
+                        // Don't fail the disbursement if loan creation fails
+                }
+
                 // Notify client
                 notificationRepository.save(Notification.builder()
                                 .user(client)
@@ -338,6 +377,7 @@ public class CreditService {
                                 .totalCost(totalCost.setScale(3, RoundingMode.HALF_UP))
                                 .totalInterest(totalInterest.setScale(3, RoundingMode.HALF_UP))
                                 .status(c.getStatus().name())
+                                .purpose(c.getPurpose())
                                 .aiRiskScore(c.getAiRiskScore())
                                 .createdAt(c.getCreatedAt())
                                 .decidedAt(c.getDecidedAt())
@@ -347,5 +387,11 @@ public class CreditService {
                                                 ? requester.getAgency().getBranchName()
                                                 : null)
                                 .build();
+        }
+
+        /** Sanitize input to prevent XSS */
+        private String sanitize(String input) {
+                if (input == null) return null;
+                return input.replaceAll("[<>\"'&]", "");
         }
 }

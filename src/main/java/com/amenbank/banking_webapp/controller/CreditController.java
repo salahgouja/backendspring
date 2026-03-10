@@ -2,16 +2,23 @@ package com.amenbank.banking_webapp.controller;
 
 import com.amenbank.banking_webapp.dto.request.CreditReviewRequest;
 import com.amenbank.banking_webapp.dto.request.CreditSimulationRequest;
+import com.amenbank.banking_webapp.dto.response.CreditDocumentResponse;
 import com.amenbank.banking_webapp.dto.response.CreditResponse;
+import com.amenbank.banking_webapp.model.CreditDocument;
+import com.amenbank.banking_webapp.service.CreditDocumentService;
 import com.amenbank.banking_webapp.service.CreditService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.core.io.Resource;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.Authentication;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
 import java.util.UUID;
@@ -19,10 +26,11 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/credits")
 @RequiredArgsConstructor
-@Tag(name = "Credits", description = "Simulation, demande, suivi et gestion des crédits")
+@Tag(name = "Credits", description = "Simulation, demande, suivi, gestion des crédits et pièces justificatives")
 public class CreditController {
 
     private final CreditService creditService;
+    private final CreditDocumentService creditDocumentService;
 
     // ── Client endpoints ──────────────────────────────────
 
@@ -84,5 +92,51 @@ public class CreditController {
     @Operation(summary = "Décaisser un crédit approuvé (Admin uniquement)")
     public ResponseEntity<CreditResponse> disburseCredit(@PathVariable UUID id) {
         return ResponseEntity.ok(creditService.disburseCredit(id));
+    }
+
+    // ============================================================
+    // GAP-6: Credit Document Endpoints (Pièces justificatives)
+    // ============================================================
+
+    @PostMapping("/{id}/documents")
+    @Operation(summary = "Uploader un justificatif pour une demande de crédit",
+            description = "Formats acceptés: PDF, JPEG, PNG, DOC, DOCX. Taille max: 10 MB. Max 10 documents par demande.")
+    public ResponseEntity<CreditDocumentResponse> uploadDocument(
+            Authentication auth,
+            @PathVariable UUID id,
+            @RequestParam("file") MultipartFile file,
+            @RequestParam(value = "documentType", required = false) CreditDocument.DocumentType documentType) {
+        return ResponseEntity.ok(creditDocumentService.uploadDocument(auth.getName(), id, file, documentType));
+    }
+
+    @GetMapping("/{id}/documents")
+    @Operation(summary = "Lister les justificatifs d'une demande de crédit")
+    public ResponseEntity<List<CreditDocumentResponse>> getDocuments(
+            Authentication auth,
+            @PathVariable UUID id) {
+        return ResponseEntity.ok(creditDocumentService.getDocuments(auth.getName(), id));
+    }
+
+    @GetMapping("/{id}/documents/{docId}")
+    @Operation(summary = "Télécharger un justificatif")
+    public ResponseEntity<Resource> downloadDocument(
+            Authentication auth,
+            @PathVariable UUID id,
+            @PathVariable UUID docId) {
+        Resource resource = creditDocumentService.downloadDocument(auth.getName(), id, docId);
+        return ResponseEntity.ok()
+                .contentType(MediaType.APPLICATION_OCTET_STREAM)
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + resource.getFilename() + "\"")
+                .body(resource);
+    }
+
+    @DeleteMapping("/{id}/documents/{docId}")
+    @Operation(summary = "Supprimer un justificatif")
+    public ResponseEntity<Void> deleteDocument(
+            Authentication auth,
+            @PathVariable UUID id,
+            @PathVariable UUID docId) {
+        creditDocumentService.deleteDocument(auth.getName(), id, docId);
+        return ResponseEntity.noContent().build();
     }
 }

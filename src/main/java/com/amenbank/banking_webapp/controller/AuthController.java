@@ -1,8 +1,10 @@
 package com.amenbank.banking_webapp.controller;
 
 import com.amenbank.banking_webapp.dto.request.ChangePasswordRequest;
+import com.amenbank.banking_webapp.dto.request.ForgotPasswordRequest;
 import com.amenbank.banking_webapp.dto.request.LoginRequest;
 import com.amenbank.banking_webapp.dto.request.RegisterRequest;
+import com.amenbank.banking_webapp.dto.request.ResetPasswordRequest;
 import com.amenbank.banking_webapp.dto.request.UpdateProfileRequest;
 import com.amenbank.banking_webapp.dto.response.AuthResponse;
 import com.amenbank.banking_webapp.dto.response.UserProfileResponse;
@@ -115,5 +117,24 @@ public class AuthController {
             @AuthenticationPrincipal UserDetails userDetails,
             @RequestBody UpdateProfileRequest request) {
         return ResponseEntity.ok(authService.updateProfile(userDetails.getUsername(), request));
+    }
+
+    // ── GAP-13: Forgot Password (send OTP) ──────────────
+    @PostMapping("/forgot-password")
+    @Operation(summary = "Request password reset — sends OTP code",
+            description = "Sends a 6-digit OTP code to the user's notification inbox (in production: via email/SMS). OTP expires in 15 minutes.")
+    public ResponseEntity<Map<String, String>> forgotPassword(
+            @Valid @RequestBody ForgotPasswordRequest request) {
+        return ResponseEntity.ok(authService.forgotPassword(request.getEmail()));
+    }
+
+    // ── GAP-13: Reset Password (verify OTP) ─────────────
+    @PostMapping("/reset-password")
+    @Operation(summary = "Reset password using OTP code",
+            description = "Verifies the OTP and sets a new password. The OTP is single-use and expires in 15 minutes.")
+    public ResponseEntity<Map<String, String>> resetPassword(
+            @Valid @RequestBody ResetPasswordRequest request) {
+        return ResponseEntity.ok(authService.resetPassword(
+                request.getEmail(), request.getOtpCode(), request.getNewPassword()));
     }
 }

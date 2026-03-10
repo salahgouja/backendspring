@@ -43,6 +43,9 @@ public class CreditRequest {
     @Column(precision = 15, scale = 3)
     private BigDecimal monthlyPayment;
 
+    @Column(columnDefinition = "TEXT")
+    private String purpose; // Justification / motif de la demande de crédit
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     @Builder.Default

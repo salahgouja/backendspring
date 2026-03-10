@@ -217,4 +217,52 @@ public class AdminController {
             @RequestParam(defaultValue = "50") int size) {
         return ResponseEntity.ok(auditService.getAuditLogs(page, size));
     }
+
+    // ── GAP-21: Agent Dashboard (agency-specific stats) ──
+    @GetMapping("/agent/dashboard")
+    @PreAuthorize("hasAnyRole('AGENT', 'ADMIN')")
+    @Operation(summary = "Get agency-specific dashboard stats (Agent/Admin)")
+    public ResponseEntity<Map<String, Object>> getAgentDashboard(
+            @AuthenticationPrincipal UserDetails adminDetails) {
+
+        User agent = userRepository.findByEmail(adminDetails.getUsername())
+                .orElseThrow(() -> new BankingException.NotFoundException("Agent not found"));
+
+        Map<String, Object> stats = new HashMap<>();
+        stats.put("agentName", agent.getFullNameFr());
+        stats.put("userType", agent.getUserType().name());
+
+        if (agent.getAgency() != null) {
+            stats.put("agencyName", agent.getAgency().getBranchName());
+            stats.put("agencyGovernorate", agent.getAgency().getGovernorate());
+
+            UUID agencyId = agent.getAgency().getId();
+            // Clients in this agency
+            long agencyClients = userRepository.findAll().stream()
+                    .filter(u -> u.getAgency() != null && u.getAgency().getId().equals(agencyId))
+                    .filter(u -> u.getUserType() == User.UserType.PARTICULIER
+                            || u.getUserType() == User.UserType.COMMERCANT)
+                    .count();
+            stats.put("agencyClients", agencyClients);
+
+            // Pending accounts in this agency
+            long pendingAccounts = accountRepository.findByUserAgencyIdAndStatus(
+                    agencyId, com.amenbank.banking_webapp.model.Account.AccountStatus.PENDING_APPROVAL).size();
+            stats.put("pendingAccounts", pendingAccounts);
+
+            // Active accounts in this agency
+            long activeAccounts = accountRepository.findByUserAgencyIdAndStatusIn(
+                    agencyId, List.of(com.amenbank.banking_webapp.model.Account.AccountStatus.ACTIVE)).size();
+            stats.put("activeAccounts", activeAccounts);
+        } else {
+            // Admin with no agency — show global stats
+            stats.put("agencyName", "N/A (Siège)");
+            stats.put("totalClients", userRepository.countByUserType(User.UserType.PARTICULIER)
+                    + userRepository.countByUserType(User.UserType.COMMERCANT));
+            stats.put("pendingAccounts", accountRepository.countByStatus(
+                    com.amenbank.banking_webapp.model.Account.AccountStatus.PENDING_APPROVAL));
+        }
+
+        return ResponseEntity.ok(stats);
+    }
 }

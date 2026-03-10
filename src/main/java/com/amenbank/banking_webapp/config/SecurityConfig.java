@@ -87,7 +87,8 @@ public class SecurityConfig {
                                 .authorizeHttpRequests(auth -> auth
                                                 // ── Public endpoints (no auth required) ──────
                                                 .requestMatchers("/auth/register", "/auth/login",
-                                                                "/auth/refresh", "/auth/2fa/verify")
+                                                                "/auth/refresh", "/auth/2fa/verify",
+                                                                "/auth/forgot-password", "/auth/reset-password")
                                                 .permitAll()
                                                 .requestMatchers("/agencies/**").permitAll()
                                                 .requestMatchers("/swagger-ui/**", "/api-docs/**", "/v3/api-docs/**")
@@ -95,6 +96,7 @@ public class SecurityConfig {
                                                 .requestMatchers("/actuator/health").permitAll()
 
                                                 // ── Admin-only endpoints ──────────────────────
+                                                .requestMatchers("/admin/agent/**").hasAnyRole("AGENT", "ADMIN")
                                                 .requestMatchers("/admin/**").hasRole("ADMIN")
 
                                                 // ── Agent + Admin endpoints ───────────────────

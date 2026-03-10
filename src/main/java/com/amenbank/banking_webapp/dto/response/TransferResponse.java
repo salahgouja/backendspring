@@ -11,6 +11,7 @@ import java.util.UUID;
 @Builder
 public class TransferResponse {
     private UUID id;
+    private String referenceNumber;
     private UUID senderAccountId;
     private String senderAccountNumber;
     private UUID receiverAccountId;
@@ -20,6 +21,9 @@ public class TransferResponse {
     private String currency;
     private String motif;
     private String status;
+    private Boolean isRecurring;
+    private Integer recurrenceIntervalMonths;
+    private LocalDateTime scheduledAt;
     private LocalDateTime executedAt;
     private LocalDateTime createdAt;
 }

@@ -20,4 +20,7 @@ public class TransferRequest {
     private BigDecimal amount;
 
     private String motif;
+
+    /** TOTP code for 2FA verification before transfer execution (required if 2FA is enabled) */
+    private String totpCode;
 }
