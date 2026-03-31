@@ -23,7 +23,7 @@ public class Transfer {
     @GeneratedValue(strategy = GenerationType.UUID)
     private UUID id;
 
-    /** GAP-12: Human-readable reference number for receipts (e.g. VIR-20260305-00001) */
+    /**  Human-readable reference number for receipts (e.g. VIR-20260305-00001) */
     @Column(unique = true, length = 30)
     private String referenceNumber;
 

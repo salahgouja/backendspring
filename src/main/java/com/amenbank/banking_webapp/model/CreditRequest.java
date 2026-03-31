@@ -58,6 +58,23 @@ public class CreditRequest {
 
     private LocalDateTime decidedAt;
 
+    // Pricing compliance snapshot fields
+    @Column(precision = 7, scale = 4)
+    private BigDecimal benchmarkRate;
+
+    @Column(precision = 5, scale = 2)
+    private BigDecimal appliedMargin;
+
+    @Column(precision = 7, scale = 4)
+    private BigDecimal finalContractRate;
+
+    @Column(length = 50)
+    private String pricingPolicyVersion;
+
+    private Boolean capCheckPassed;
+
+    private LocalDateTime capCheckTimestamp;
+
     // ── Enums ──────────────────────────────────────────
     public enum CreditType {
         PERSONNEL, // Personal loan
@@ -73,7 +90,9 @@ public class CreditRequest {
         APPROVED,
         REJECTED,
         CANCELLED, // Cancelled by the client
-        DISBURSED // Money credited to client's account
+        DISBURSED, // Money credited to client's account
+        REPAYING,  // GAP-E: Loan is being actively repaid
+        COMPLETED  // GAP-E: Loan fully paid off
     }
 
     @Override

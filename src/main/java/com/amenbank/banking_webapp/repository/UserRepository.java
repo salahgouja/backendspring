@@ -3,6 +3,7 @@ package com.amenbank.banking_webapp.repository;
 import com.amenbank.banking_webapp.model.Agency;
 import com.amenbank.banking_webapp.model.User;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.stereotype.Repository;
 
 import java.util.List;
@@ -33,4 +34,17 @@ public interface UserRepository extends JpaRepository<User, UUID> {
     long countByIsActiveFalse();
 
     long countByIs2faEnabledTrue();
+
+    // Paginated user listing with agency eagerly fetched
+    @EntityGraph(attributePaths = "agency")
+    org.springframework.data.domain.Page<User> findByUserType(User.UserType userType,
+            org.springframework.data.domain.Pageable pageable);
+
+    @Override
+    @EntityGraph(attributePaths = "agency")
+    org.springframework.data.domain.Page<User> findAll(org.springframework.data.domain.Pageable pageable);
+
+    // Efficient count query for agency dashboard
+    @org.springframework.data.jpa.repository.Query("SELECT COUNT(u) FROM User u WHERE u.agency.id = :agencyId AND u.userType IN :types")
+    long countByAgencyIdAndUserTypeIn(UUID agencyId, List<User.UserType> types);
 }

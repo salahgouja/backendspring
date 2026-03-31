@@ -16,6 +16,7 @@ public class UserProfileResponse {
     private String fullNameAr;
     private String fullNameFr;
     private String cin;
+    private String profileImageUrl;
     private User.UserType userType;
     private Boolean isActive;
     private Boolean is2faEnabled;

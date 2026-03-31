@@ -16,6 +16,7 @@ public class AuthResponse {
     private UUID userId;
     private String email;
     private String fullName;
+    private String profileImageUrl;
     private User.UserType userType;
     private Boolean is2faEnabled;
     private Boolean requires2fa; // True if user needs to verify 2FA before full access

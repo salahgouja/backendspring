@@ -14,6 +14,11 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -22,11 +27,12 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.web.bind.annotation.*;
 
 import jakarta.validation.Valid;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/admin")
@@ -96,23 +102,25 @@ public class AdminController {
         return ResponseEntity.ok(response);
     }
 
-    // ── List all users ────────────────────────────────────
+    // ── List all users (BUG-5 fix: paginated) ───────────
     @GetMapping("/users")
     @PreAuthorize("hasRole('ADMIN')")
-    @Operation(summary = "List all users (admin only)")
-    public ResponseEntity<List<Map<String, Object>>> listUsers(
-            @RequestParam(required = false) User.UserType userType) {
+    @Operation(summary = "List all users — paginated (admin only)")
+    public ResponseEntity<Page<Map<String, Object>>> listUsers(
+            @RequestParam(required = false) User.UserType userType,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
 
-        List<User> users;
+        PageRequest pageRequest = PageRequest.of(page, size, Sort.by("createdAt").descending());
+
+        Page<User> usersPage;
         if (userType != null) {
-            users = userRepository.findAll().stream()
-                    .filter(u -> u.getUserType() == userType)
-                    .collect(Collectors.toList());
+            usersPage = userRepository.findByUserType(userType, pageRequest);
         } else {
-            users = userRepository.findAll();
+            usersPage = userRepository.findAll(pageRequest);
         }
 
-        List<Map<String, Object>> result = users.stream().map(u -> {
+        Page<Map<String, Object>> result = usersPage.map(u -> {
             Map<String, Object> map = new HashMap<>();
             map.put("id", u.getId());
             map.put("email", u.getEmail());
@@ -126,7 +134,7 @@ public class AdminController {
             map.put("agencyName", u.getAgency() != null ? u.getAgency().getBranchName() : null);
             map.put("createdAt", u.getCreatedAt());
             return map;
-        }).collect(Collectors.toList());
+        });
 
         return ResponseEntity.ok(result);
     }
@@ -211,11 +219,62 @@ public class AdminController {
     // ── Audit Logs (fix #24) ──────────────────────────────
     @GetMapping("/audit-logs")
     @PreAuthorize("hasRole('ADMIN')")
-    @Operation(summary = "View audit logs (admin only)")
+    @Operation(summary = "View audit logs with optional filters (admin only)")
     public ResponseEntity<Page<Map<String, Object>>> getAuditLogs(
             @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "50") int size) {
-        return ResponseEntity.ok(auditService.getAuditLogs(page, size));
+            @RequestParam(defaultValue = "50") int size,
+            @RequestParam(required = false) String actorEmail,
+            @RequestParam(required = false) AuditLog.AuditAction action,
+            @RequestParam(required = false) String entityType,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate dateFrom,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate dateTo) {
+
+        LocalDateTime from = dateFrom != null ? dateFrom.atStartOfDay() : null;
+        LocalDateTime to = dateTo != null ? dateTo.plusDays(1).atStartOfDay().minusNanos(1) : null;
+        validateDateRange(from, to);
+
+        return ResponseEntity.ok(auditService.getFilteredAuditLogs(
+                actorEmail, action, entityType, from, to, page, size
+        ));
+    }
+
+    @GetMapping("/audit-logs/mine")
+    @PreAuthorize("hasAnyRole('AGENT', 'ADMIN')")
+    @Operation(summary = "View current user's audit logs (agent/admin)")
+    public ResponseEntity<Page<Map<String, Object>>> getMyAuditLogs(
+            @AuthenticationPrincipal UserDetails userDetails,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
+        return ResponseEntity.ok(auditService.getMyAuditLogs(userDetails.getUsername(), page, size));
+    }
+
+    @GetMapping("/audit-logs/export")
+    @PreAuthorize("hasRole('ADMIN')")
+    @Operation(summary = "Export filtered audit logs to CSV (admin only)")
+    public ResponseEntity<String> exportAuditLogsCsv(
+            @RequestParam(required = false) String actorEmail,
+            @RequestParam(required = false) AuditLog.AuditAction action,
+            @RequestParam(required = false) String entityType,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate dateFrom,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate dateTo) {
+
+        LocalDateTime from = dateFrom != null ? dateFrom.atStartOfDay() : null;
+        LocalDateTime to = dateTo != null ? dateTo.plusDays(1).atStartOfDay().minusNanos(1) : null;
+        validateDateRange(from, to);
+
+        String csv = auditService.exportToCsv(actorEmail, action, entityType, from, to);
+        String filename = "audit_logs_" + LocalDate.now() + ".csv";
+
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + filename + "\"")
+                .contentType(MediaType.parseMediaType("text/csv"))
+                .body(csv);
+    }
+
+    private void validateDateRange(LocalDateTime from, LocalDateTime to) {
+        if (from != null && to != null && from.isAfter(to)) {
+            throw new BankingException("dateFrom must be before or equal to dateTo");
+        }
     }
 
     // ── GAP-21: Agent Dashboard (agency-specific stats) ──
@@ -237,22 +296,18 @@ public class AdminController {
             stats.put("agencyGovernorate", agent.getAgency().getGovernorate());
 
             UUID agencyId = agent.getAgency().getId();
-            // Clients in this agency
-            long agencyClients = userRepository.findAll().stream()
-                    .filter(u -> u.getAgency() != null && u.getAgency().getId().equals(agencyId))
-                    .filter(u -> u.getUserType() == User.UserType.PARTICULIER
-                            || u.getUserType() == User.UserType.COMMERCANT)
-                    .count();
+            // BUG-6 fix: Use count queries instead of loading all users
+            long agencyClients = userRepository.countByAgencyIdAndUserTypeIn(agencyId,
+                    List.of(User.UserType.PARTICULIER, User.UserType.COMMERCANT));
             stats.put("agencyClients", agencyClients);
 
-            // Pending accounts in this agency
-            long pendingAccounts = accountRepository.findByUserAgencyIdAndStatus(
-                    agencyId, com.amenbank.banking_webapp.model.Account.AccountStatus.PENDING_APPROVAL).size();
+            // BUG-6 fix: Use count queries instead of .size()
+            long pendingAccounts = accountRepository.countByUserAgencyIdAndStatus(
+                    agencyId, com.amenbank.banking_webapp.model.Account.AccountStatus.PENDING_APPROVAL);
             stats.put("pendingAccounts", pendingAccounts);
 
-            // Active accounts in this agency
-            long activeAccounts = accountRepository.findByUserAgencyIdAndStatusIn(
-                    agencyId, List.of(com.amenbank.banking_webapp.model.Account.AccountStatus.ACTIVE)).size();
+            long activeAccounts = accountRepository.countByUserAgencyIdAndStatusIn(
+                    agencyId, List.of(com.amenbank.banking_webapp.model.Account.AccountStatus.ACTIVE));
             stats.put("activeAccounts", activeAccounts);
         } else {
             // Admin with no agency — show global stats

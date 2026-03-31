@@ -19,5 +19,8 @@ public interface LoanProductRepository extends JpaRepository<LoanProduct, UUID> 
     List<LoanProduct> findByCreditTypeAndIsActiveTrue(CreditRequest.CreditType creditType);
 
     boolean existsByCode(String code);
-}
 
+    boolean existsByName(String name);
+
+    boolean existsByNameAndIdNot(String name, UUID id);
+}

@@ -36,19 +36,44 @@ public class CreditService {
         private final AccountRepository accountRepository;
         private final TransactionRepository transactionRepository;
         private final LoanProductRepository loanProductRepository;
+        private final LoanContractRepository loanContractRepository;
+        private final ReferenceRateRepository referenceRateRepository;
         private final AuditService auditService;
         private final LoanEngineService loanEngineService;
+        private final PricingComplianceService pricingComplianceService;
 
-        // ── Interest rates by credit type (annual %) ───────────
-        private static final Map<CreditRequest.CreditType, BigDecimal> INTEREST_RATES = Map.of(
+        // ── Fallback interest rates by credit type (annual %) ──
+        // Used only when no active LoanProduct exists for the credit type
+        private static final Map<CreditRequest.CreditType, BigDecimal> FALLBACK_INTEREST_RATES = Map.of(
                         CreditRequest.CreditType.PERSONNEL, new BigDecimal("8.50"),
                         CreditRequest.CreditType.IMMOBILIER, new BigDecimal("5.75"),
                         CreditRequest.CreditType.COMMERCIAL, new BigDecimal("7.00"),
                         CreditRequest.CreditType.EQUIPEMENT, new BigDecimal("6.50"));
 
+        // ── GAP-G: Resolve rate from LoanProduct (real rate) or fallback ──
+        private BigDecimal resolveRate(CreditRequest.CreditType creditType) {
+                return loanProductRepository.findByCreditTypeAndIsActiveTrue(creditType)
+                                .stream()
+                                .findFirst()
+                                .map(product -> {
+                                        if (product.getRateType() == LoanProduct.RateType.VARIABLE
+                                                        && product.getReferenceIndex() != null) {
+                                                return referenceRateRepository
+                                                                .findCurrentRate(product.getReferenceIndex(), LocalDate.now())
+                                                                .map(ref -> ref.getRateValue().add(product.getMargin()))
+                                                                .orElse(FALLBACK_INTEREST_RATES.get(creditType));
+                                        } else if (product.getFixedRate() != null) {
+                                                return product.getFixedRate();
+                                        }
+                                        return FALLBACK_INTEREST_RATES.get(creditType);
+                                })
+                                .orElse(FALLBACK_INTEREST_RATES.get(creditType));
+        }
+
         // ── Simulate (no persistence) ──────────────────────────
         public CreditResponse simulate(CreditSimulationRequest request) {
-                BigDecimal rate = INTEREST_RATES.get(request.getCreditType());
+                // GAP-G: Use LoanProduct rate (same rate the actual loan will use)
+                BigDecimal rate = resolveRate(request.getCreditType());
                 BigDecimal monthlyPayment = calculateMonthlyPayment(
                                 request.getAmountRequested(), rate, request.getDurationMonths());
 
@@ -74,7 +99,8 @@ public class CreditService {
                 User user = userRepository.findByEmail(userEmail)
                                 .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
 
-                BigDecimal rate = INTEREST_RATES.get(request.getCreditType());
+                // GAP-G: Use LoanProduct rate (consistent with what the actual loan will use)
+                BigDecimal rate = resolveRate(request.getCreditType());
                 BigDecimal monthlyPayment = calculateMonthlyPayment(
                                 request.getAmountRequested(), rate, request.getDurationMonths());
 
@@ -90,7 +116,7 @@ public class CreditService {
                                 .build();
                 creditRequestRepository.save(credit);
 
-                // Notify
+                // Notify client
                 notificationRepository.save(Notification.builder()
                                 .user(user)
                                 .type(Notification.NotificationType.CREDIT)
@@ -100,6 +126,9 @@ public class CreditService {
                                                 request.getCreditType().name(), request.getAmountRequested(),
                                                 request.getDurationMonths(), monthlyPayment))
                                 .build());
+
+                // Notify agency agents (real-time notification for review)
+                notifyAgencyAgentsOfCredit(user, credit);
 
                 auditService.log(AuditLog.AuditAction.CREDIT_SUBMITTED, userEmail,
                         "CreditRequest", credit.getId().toString(),
@@ -155,11 +184,14 @@ public class CreditService {
                 User agent = userRepository.findByEmail(agentEmail)
                                 .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
 
+                List<CreditRequest.CreditStatus> actionableStatuses = List.of(
+                                CreditRequest.CreditStatus.SUBMITTED,
+                                CreditRequest.CreditStatus.APPROVED);
+
                 List<CreditRequest> pending;
                 if (agent.getUserType() == User.UserType.ADMIN) {
                         // Admin sees ALL submitted credits
-                        pending = creditRequestRepository.findPendingWithUser(
-                                        CreditRequest.CreditStatus.SUBMITTED);
+                        pending = creditRequestRepository.findPendingWithUser(actionableStatuses);
                 } else {
                         // Agent sees only credits from their agency
                         // Force initialize the lazy agency proxy
@@ -168,14 +200,14 @@ public class CreditService {
                                 return List.of();
                         }
                         UUID agencyId = agentAgency.getId();
-                        pending = creditRequestRepository.findPendingByAgency(
-                                        CreditRequest.CreditStatus.SUBMITTED, agencyId);
+                        pending = creditRequestRepository.findPendingByAgency(actionableStatuses, agencyId);
                 }
 
                 return pending.stream().map(this::toResponse).toList();
         }
 
         // ── Single credit detail ───────────────────────────────
+        @Transactional(readOnly = true)
         public CreditResponse getCreditById(String userEmail, UUID creditId) {
                 User user = userRepository.findByEmail(userEmail)
                                 .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
@@ -192,9 +224,24 @@ public class CreditService {
 
         // ── Review credit (AGENT / ADMIN) ─────────────────────
         @Transactional
-        public CreditResponse reviewCredit(UUID creditId, CreditReviewRequest request) {
+        public CreditResponse reviewCredit(UUID creditId, CreditReviewRequest request, String agentEmail) {
                 CreditRequest credit = creditRequestRepository.findById(creditId)
                                 .orElseThrow(() -> new NotFoundException(CREDIT_NOT_FOUND));
+
+                User reviewer = userRepository.findByEmail(agentEmail)
+                                .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
+                if (reviewer.getUserType() != User.UserType.AGENT && reviewer.getUserType() != User.UserType.ADMIN) {
+                        throw new ForbiddenException("Seuls les agents/admins peuvent traiter une demande de crédit");
+                }
+
+                // AGENT scope guard: can review only credits from same agency.
+                if (reviewer.getUserType() == User.UserType.AGENT) {
+                        UUID reviewerAgencyId = reviewer.getAgency() != null ? reviewer.getAgency().getId() : null;
+                        UUID borrowerAgencyId = credit.getUser().getAgency() != null ? credit.getUser().getAgency().getId() : null;
+                        if (reviewerAgencyId == null || borrowerAgencyId == null || !reviewerAgencyId.equals(borrowerAgencyId)) {
+                                throw new ForbiddenException("Accès refusé: cette demande n'appartient pas à votre agence");
+                        }
+                }
 
                 // Only SUBMITTED or IN_REVIEW credits can be reviewed
                 if (credit.getStatus() != CreditRequest.CreditStatus.SUBMITTED
@@ -237,16 +284,16 @@ public class CreditService {
                                 .body(notifBody)
                                 .build());
 
-                auditService.log(AuditLog.AuditAction.CREDIT_REVIEWED, "agent",
+                auditService.log(AuditLog.AuditAction.CREDIT_REVIEWED, agentEmail,
                         "CreditRequest", credit.getId().toString(),
                         "Decision: " + request.getDecision());
 
                 return toResponse(credit);
         }
 
-        // ── Disburse credit (ADMIN only) ──────────────────────
+        // ── Disburse credit (AGENT / ADMIN) ──────────────────────
         @Transactional
-        public CreditResponse disburseCredit(UUID creditId) {
+        public CreditResponse disburseCredit(UUID creditId, String adminEmail) {
                 CreditRequest credit = creditRequestRepository.findById(creditId)
                                 .orElseThrow(() -> new NotFoundException(CREDIT_NOT_FOUND));
 
@@ -256,20 +303,68 @@ public class CreditService {
                                                         + credit.getStatus() + ")");
                 }
 
-                // Find client's first active account
+                LoanProduct matchingProduct = loanProductRepository
+                                .findByCreditTypeAndIsActiveTrue(credit.getCreditType())
+                                .stream()
+                                .findFirst()
+                                .orElseThrow(() -> new BankingException(
+                                                "Aucun produit de prêt actif trouvé pour ce type de crédit"));
+
+                BigDecimal benchmarkRate = BigDecimal.ZERO;
+                BigDecimal finalRate;
+                if (matchingProduct.getRateType() == LoanProduct.RateType.VARIABLE
+                                && matchingProduct.getReferenceIndex() != null) {
+                        ReferenceRate ref = referenceRateRepository
+                                        .findCurrentRate(matchingProduct.getReferenceIndex(), LocalDate.now())
+                                        .orElseThrow(() -> new NotFoundException(
+                                                        "Taux de référence introuvable: " + matchingProduct.getReferenceIndex()));
+                        benchmarkRate = ref.getRateValue();
+                        finalRate = benchmarkRate.add(matchingProduct.getMargin());
+                } else {
+                        finalRate = matchingProduct.getFixedRate();
+                }
+
+                // Mandatory cap-check snapshot before disbursement.
+                pricingComplianceService.validateAndSnapshot(credit, matchingProduct, benchmarkRate, finalRate);
+                creditRequestRepository.save(credit);
+
+                // Find client's first active and approved account
                 User client = credit.getUser();
                 List<Account> accounts = accountRepository.findByUserId(client.getId());
                 Account targetAccount = accounts.stream()
-                                .filter(a -> Boolean.TRUE.equals(a.getIsActive()))
+                                .filter(a -> Boolean.TRUE.equals(a.getIsActive())
+                                                && a.getStatus() == Account.AccountStatus.ACTIVE)
                                 .findFirst()
                                 .orElseThrow(() -> new NotFoundException(
                                                 "Le client n'a aucun compte actif pour le décaissement"));
 
-                // Credit the loan amount
+                // Find and debit bank treasury account
+                Account treasuryAccount = accountRepository.findByAccountType(Account.AccountType.TREASURY)
+                                .orElseThrow(() -> new BankingException("Compte trésorerie banque introuvable"));
+
+                if (treasuryAccount.getBalance().compareTo(credit.getAmountRequested()) < 0) {
+                        throw new BankingException("Fonds insuffisants dans le compte trésorerie de la banque");
+                }
+
+                treasuryAccount.setBalance(treasuryAccount.getBalance().subtract(credit.getAmountRequested()));
+                accountRepository.save(treasuryAccount);
+
+                Transaction treasuryTx = Transaction.builder()
+                                .account(treasuryAccount)
+                                .type(Transaction.TransactionType.DEBIT)
+                                .amount(credit.getAmountRequested())
+                                .balanceAfter(treasuryAccount.getBalance())
+                                .description("Décaissement crédit " + credit.getCreditType().name()
+                                                + " #" + credit.getId().toString().substring(0, 8)
+                                                + " → " + targetAccount.getAccountNumber())
+                                .category("credit_disbursement")
+                                .build();
+                transactionRepository.save(treasuryTx);
+
+                // Credit client account
                 targetAccount.setBalance(targetAccount.getBalance().add(credit.getAmountRequested()));
                 accountRepository.save(targetAccount);
 
-                // Create CREDIT transaction
                 Transaction tx = Transaction.builder()
                                 .account(targetAccount)
                                 .type(Transaction.TransactionType.CREDIT)
@@ -287,30 +382,23 @@ public class CreditService {
 
                 // ── GAP-14: Bridge to Loan Engine — Create LoanContract ──
                 try {
-                        LoanProduct matchingProduct = loanProductRepository
-                                        .findByCreditTypeAndIsActiveTrue(credit.getCreditType())
-                                        .stream()
-                                        .findFirst()
-                                        .orElse(null);
+                        LoanContract loan = loanEngineService.createLoan(
+                                        client,
+                                        matchingProduct,
+                                        credit.getAmountRequested(),
+                                        credit.getDurationMonths(),
+                                        LoanContract.GracePeriodType.NONE,
+                                        0,
+                                        LocalDate.now(),
+                                        targetAccount,
+                                        credit);
 
-                        if (matchingProduct != null) {
-                                LoanContract loan = loanEngineService.createLoan(
-                                                client,
-                                                matchingProduct,
-                                                credit.getAmountRequested(),
-                                                credit.getDurationMonths(),
-                                                LoanContract.GracePeriodType.NONE,
-                                                0,
-                                                LocalDate.now(),
-                                                targetAccount,
-                                                credit);
+                        log.info("Loan contract {} created from credit request {}",
+                                        loan.getContractNumber(), credit.getId());
 
-                                log.info("Loan contract {} created from credit request {}",
-                                                loan.getContractNumber(), credit.getId());
-                        } else {
-                                log.warn("No active loan product found for credit type {}, skipping loan creation",
-                                                credit.getCreditType());
-                        }
+                        // GAP-E: Update credit status to REPAYING (loan is now active)
+                        credit.setStatus(CreditRequest.CreditStatus.REPAYING);
+                        creditRequestRepository.save(credit);
                 } catch (Exception e) {
                         log.error("Failed to create loan contract for credit {}: {}",
                                         credit.getId(), e.getMessage());
@@ -328,11 +416,32 @@ public class CreditService {
                                                 targetAccount.getAccountNumber(), targetAccount.getBalance()))
                                 .build());
 
-                auditService.log(AuditLog.AuditAction.CREDIT_DISBURSED, "admin",
+                auditService.log(AuditLog.AuditAction.CREDIT_DISBURSED, adminEmail,
                         "CreditRequest", credit.getId().toString(),
                         "Disbursed " + credit.getAmountRequested() + " TND to " + targetAccount.getAccountNumber());
 
                 return toResponse(credit);
+        }
+        // ── Notify agency agents of new credit request ────────
+        private void notifyAgencyAgentsOfCredit(User client, CreditRequest credit) {
+                Agency agency = client.getAgency();
+                if (agency == null) return;
+
+                List<User> agents = userRepository.findByUserTypeAndAgency(User.UserType.AGENT, agency);
+                for (User agent : agents) {
+                        notificationRepository.save(Notification.builder()
+                                        .user(agent)
+                                        .type(Notification.NotificationType.CREDIT)
+                                        .title("Nouvelle demande de crédit")
+                                        .body(String.format(
+                                                        "%s (%s) a soumis une demande de crédit %s de %.3f TND sur %d mois à l'agence %s.",
+                                                        client.getFullNameFr(), client.getCin(),
+                                                        credit.getCreditType().name(), credit.getAmountRequested(),
+                                                        credit.getDurationMonths(), agency.getBranchName()))
+                                        .build());
+                }
+                log.info("Notified {} agent(s) of new credit request {} from {}",
+                                agents.size(), credit.getId(), client.getEmail());
         }
 
         // ── Annuity formula ────────────────────────────────────
@@ -367,6 +476,20 @@ public class CreditService {
                 BigDecimal totalInterest = totalCost.subtract(c.getAmountRequested());
 
                 User requester = c.getUser();
+
+                // GAP-C: Lookup linked loan contract
+                UUID loanContractId = null;
+                String loanContractNumber = null;
+                if (c.getId() != null && (c.getStatus() == CreditRequest.CreditStatus.DISBURSED
+                                || c.getStatus() == CreditRequest.CreditStatus.REPAYING
+                                || c.getStatus() == CreditRequest.CreditStatus.COMPLETED)) {
+                        var loanOpt = loanContractRepository.findByCreditRequestId(c.getId());
+                        if (loanOpt.isPresent()) {
+                                loanContractId = loanOpt.get().getId();
+                                loanContractNumber = loanOpt.get().getContractNumber();
+                        }
+                }
+
                 return CreditResponse.builder()
                                 .id(c.getId())
                                 .creditType(c.getCreditType().name())
@@ -386,12 +509,14 @@ public class CreditService {
                                 .agencyName(requester != null && requester.getAgency() != null
                                                 ? requester.getAgency().getBranchName()
                                                 : null)
+                                .loanContractId(loanContractId)
+                                .loanContractNumber(loanContractNumber)
                                 .build();
         }
 
-        /** Sanitize input to prevent XSS */
+        /** Sanitize input to prevent XSS — SEC-6 fix */
         private String sanitize(String input) {
                 if (input == null) return null;
-                return input.replaceAll("[<>\"'&]", "");
+                return org.springframework.web.util.HtmlUtils.htmlEscape(input);
         }
 }

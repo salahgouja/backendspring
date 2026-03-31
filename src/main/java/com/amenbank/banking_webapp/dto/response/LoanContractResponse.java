@@ -43,6 +43,8 @@ public class LoanContractResponse {
     private String userName;
     private String userEmail;
 
+    // Link back to originating credit request when available
+    private UUID creditRequestId;
+
     private LocalDateTime createdAt;
 }
-

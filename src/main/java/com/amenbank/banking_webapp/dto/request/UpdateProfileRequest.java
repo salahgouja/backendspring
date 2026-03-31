@@ -7,5 +7,6 @@ public class UpdateProfileRequest {
     private String phone;
     private String fullNameAr;
     private String fullNameFr;
+    private String profileImageUrl;
 }
 

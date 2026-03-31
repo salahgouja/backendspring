@@ -16,9 +16,9 @@ public interface AmortizationScheduleRepository extends JpaRepository<Amortizati
 
     List<AmortizationSchedule> findByLoanContractIdOrderByInstallmentNumberAsc(UUID loanContractId);
 
-    /** Next unpaid installment for a loan */
+    /** Next unpaid installment for a loan, including partially paid lines */
     @Query("SELECT a FROM AmortizationSchedule a WHERE a.loanContract.id = :loanId " +
-           "AND a.status IN ('PENDING', 'DUE', 'OVERDUE', 'GRACE') ORDER BY a.installmentNumber ASC LIMIT 1")
+           "AND a.status IN ('PENDING', 'DUE', 'OVERDUE', 'GRACE', 'PARTIAL') ORDER BY a.installmentNumber ASC LIMIT 1")
     Optional<AmortizationSchedule> findNextDue(@Param("loanId") UUID loanId);
 
     /** All overdue installments */
@@ -30,9 +30,17 @@ public interface AmortizationScheduleRepository extends JpaRepository<Amortizati
     @Query("SELECT a FROM AmortizationSchedule a WHERE a.dueDate <= :date AND a.status = 'PENDING'")
     List<AmortizationSchedule> findDueOnOrBefore(@Param("date") LocalDate date);
 
+    /** All installments due on a specific date (for reminders) — GAP-I */
+    @Query("SELECT a FROM AmortizationSchedule a WHERE a.dueDate = :date AND a.status = 'PENDING'")
+    List<AmortizationSchedule> findDueOnDate(@Param("date") LocalDate date);
+
     /** Remaining unpaid schedule lines for recalculation */
     @Query("SELECT a FROM AmortizationSchedule a WHERE a.loanContract.id = :loanId " +
            "AND a.status IN ('PENDING', 'DUE', 'GRACE') ORDER BY a.installmentNumber ASC")
     List<AmortizationSchedule> findRemainingByLoanId(@Param("loanId") UUID loanId);
-}
 
+    /** Collectible installments for auto-debit (due or overdue, including partial). */
+    @Query("SELECT a FROM AmortizationSchedule a WHERE a.dueDate <= :date " +
+           "AND a.status IN ('PENDING', 'DUE', 'OVERDUE', 'PARTIAL')")
+    List<AmortizationSchedule> findCollectibleOnOrBefore(@Param("date") LocalDate date);
+}

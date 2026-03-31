@@ -49,7 +49,6 @@ public class Notification {
         SECURITY,
         CREDIT,
         ACCOUNT,
-        FRAUD,
         PROMOTION
     }
 

@@ -26,7 +26,9 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Service
 @RequiredArgsConstructor
@@ -35,6 +37,11 @@ public class TransferService {
 
     private static final String BEAN_NAME = "TransferService";
     private static final String USER_NOT_FOUND = "Utilisateur introuvable";
+    private static final AtomicLong REFERENCE_SEQ = new AtomicLong(System.currentTimeMillis() % 100_000);
+    private static final HashingAlgorithm TOTP_ALGORITHM = HashingAlgorithm.SHA1;
+    private static final int TOTP_DIGITS = 6;
+    private static final int TOTP_PERIOD_SECONDS = 30;
+    private static final int TOTP_ALLOWED_TIME_STEPS = 1;
 
     private final TransferRepository transferRepository;
     private final AccountRepository accountRepository;
@@ -44,7 +51,6 @@ public class TransferService {
     private final BatchTransferRepository batchTransferRepository;
     private final BatchTransferItemRepository batchTransferItemRepository;
     private final AuditService auditService;
-    private final FraudService fraudService;
     private final EmailService emailService;
 
     @Value("${app.transfer.max-amount-per-transaction:100000.000}")
@@ -68,7 +74,7 @@ public class TransferService {
     }
 
     // ============================================================
-    // GAP-11: Self-Transfer (between own accounts — no 2FA, no daily limit)
+    // Self-Transfer (between own accounts — no 2FA, no daily limit)
     // ============================================================
     @Transactional
     public TransferResponse createSelfTransfer(String userEmail, TransferRequest request) {
@@ -225,10 +231,7 @@ public class TransferService {
                 String.format("%.3f %s from %s to %s", amount, senderAccount.getCurrency(),
                         senderAccount.getAccountNumber(), receiverAccount.getAccountNumber()));
 
-        // 17. Fraud analysis (fix #10)
-        fraudService.analyzeTransfer(transfer, sender);
-
-        // 18. GAP-23: Email confirmation
+        // 17. GAP-23: Email confirmation
         emailService.sendTransferConfirmation(sender.getEmail(),
                 senderAccount.getAccountNumber(), receiverAccount.getAccountNumber(),
                 String.format("%.3f", amount), transfer.getReferenceNumber());
@@ -762,14 +765,13 @@ public class TransferService {
 
     private String sanitizeMotif(String motif) {
         if (motif == null) return null;
-        return motif.replaceAll("[<>\"'&]", "");
+        return org.springframework.web.util.HtmlUtils.htmlEscape(motif);
     }
 
-    /** GAP-12: Generate a human-readable reference number for transfer receipts */
+    /** GAP-12: Generate a human-readable, unique reference number (PERF-4 fix: AtomicLong) */
     private String generateReferenceNumber() {
         String date = LocalDate.now().toString().replace("-", "");
-        String seq = String.format("%05d",
-                Math.abs(UUID.randomUUID().getLeastSignificantBits() % 100_000));
+        String seq = String.format("%06d", REFERENCE_SEQ.incrementAndGet() % 1_000_000);
         return "VIR-" + date + "-" + seq;
     }
 
@@ -784,9 +786,17 @@ public class TransferService {
         if (user.getTotpSecret() == null) {
             throw new BankingException("Configuration 2FA incomplète. Veuillez reconfigurer le 2FA.");
         }
-        CodeVerifier verifier = new DefaultCodeVerifier(
-                new DefaultCodeGenerator(), new SystemTimeProvider());
-        if (!verifier.isValidCode(user.getTotpSecret(), totpCode)) {
+
+        String normalizedSecret = user.getTotpSecret().replace(" ", "").toUpperCase(Locale.ROOT);
+        String normalizedCode = totpCode.replaceAll("\\s+", "");
+
+        DefaultCodeVerifier verifier = new DefaultCodeVerifier(
+                new DefaultCodeGenerator(TOTP_ALGORITHM, TOTP_DIGITS),
+                new SystemTimeProvider());
+        verifier.setTimePeriod(TOTP_PERIOD_SECONDS);
+        verifier.setAllowedTimePeriodDiscrepancy(TOTP_ALLOWED_TIME_STEPS);
+
+        if (!verifier.isValidCode(normalizedSecret, normalizedCode)) {
             throw new BankingException("Code 2FA invalide. Virement refusé.");
         }
     }

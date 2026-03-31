@@ -45,7 +45,10 @@ public class User {
     private String fullNameFr;
 
     @Column(unique = true, nullable = false, length = 8)
-    private String cin; // Carte d'Identité Nationale
+    private String cin;
+
+    @Column(columnDefinition = "TEXT")
+    private String profileImageUrl;
 
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)

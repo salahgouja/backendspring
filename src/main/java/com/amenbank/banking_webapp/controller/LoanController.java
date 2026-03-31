@@ -1,13 +1,17 @@
 package com.amenbank.banking_webapp.controller;
 
+import com.amenbank.banking_webapp.dto.request.LoanApplicationRequest;
 import com.amenbank.banking_webapp.dto.request.LoanSimulationRequest;
 import com.amenbank.banking_webapp.dto.response.AmortizationLineResponse;
+import com.amenbank.banking_webapp.dto.response.CreditResponse;
 import com.amenbank.banking_webapp.dto.response.LoanContractResponse;
 import com.amenbank.banking_webapp.dto.response.LoanProductResponse;
+import com.amenbank.banking_webapp.dto.request.CreditSimulationRequest;
 import com.amenbank.banking_webapp.exception.BankingException;
 import com.amenbank.banking_webapp.exception.BankingException.NotFoundException;
 import com.amenbank.banking_webapp.model.*;
 import com.amenbank.banking_webapp.repository.*;
+import com.amenbank.banking_webapp.service.CreditService;
 import com.amenbank.banking_webapp.service.LoanEngineService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.security.SecurityRequirement;
@@ -32,6 +36,7 @@ import java.util.*;
 public class LoanController {
 
     private final LoanEngineService loanEngineService;
+    private final CreditService creditService;
     private final LoanProductRepository loanProductRepository;
     private final LoanContractRepository loanContractRepository;
     private final ReferenceRateRepository referenceRateRepository;
@@ -103,12 +108,10 @@ public class LoanController {
     @PreAuthorize("hasRole('ADMIN')")
     @Operation(summary = "Publish a new reference rate (Admin only)")
     public ResponseEntity<Map<String, Object>> publishRate(@RequestBody Map<String, Object> body) {
-        String indexName = (String) body.get("indexName");
-        BigDecimal rateValue = new BigDecimal(body.get("rateValue").toString());
-        LocalDate effectiveDate = body.get("effectiveDate") != null
-                ? LocalDate.parse(body.get("effectiveDate").toString())
-                : LocalDate.now();
-        String source = (String) body.getOrDefault("source", "BCT");
+        String indexName = readRequiredString(body, "indexName");
+        BigDecimal rateValue = readRequiredBigDecimal(body, "rateValue");
+        LocalDate effectiveDate = readOptionalDate(body, "effectiveDate", LocalDate.now());
+        String source = readOptionalString(body, "source", "BCT");
 
         ReferenceRate rate = ReferenceRate.builder()
                 .indexName(indexName)
@@ -116,6 +119,8 @@ public class LoanController {
                 .effectiveDate(effectiveDate)
                 .source(source)
                 .build();
+
+        validateReferenceRate(rate);
         referenceRateRepository.save(rate);
 
         // Trigger rate revision for all affected variable-rate loans
@@ -126,6 +131,64 @@ public class LoanController {
                 "indexName", indexName,
                 "rateValue", rateValue,
                 "effectiveDate", effectiveDate,
+                "loansRevised", revised
+        ));
+    }
+
+    @PutMapping("/reference-rates/{id}")
+    @PreAuthorize("hasRole('ADMIN')")
+    @Operation(summary = "Update a reference rate (Admin only)")
+    public ResponseEntity<Map<String, Object>> updateRate(@PathVariable UUID id, @RequestBody ReferenceRate request) {
+        ReferenceRate existing = referenceRateRepository.findById(id)
+                .orElseThrow(() -> new NotFoundException("Taux de référence introuvable: " + id));
+
+        String oldIndexName = existing.getIndexName();
+
+        if (request.getIndexName() != null) existing.setIndexName(request.getIndexName());
+        if (request.getRateValue() != null) existing.setRateValue(request.getRateValue());
+        if (request.getEffectiveDate() != null) existing.setEffectiveDate(request.getEffectiveDate());
+        if (request.getSource() != null) existing.setSource(request.getSource());
+
+        validateReferenceRate(existing);
+        referenceRateRepository.save(existing);
+
+        int revisedOld = loanEngineService.reviseVariableRateLoans(oldIndexName);
+        int revisedNew = oldIndexName.equals(existing.getIndexName())
+                ? revisedOld
+                : loanEngineService.reviseVariableRateLoans(existing.getIndexName());
+
+        return ResponseEntity.ok(Map.of(
+                "message", "Taux de référence mis à jour avec succès",
+                "id", existing.getId(),
+                "indexName", existing.getIndexName(),
+                "rateValue", existing.getRateValue(),
+                "effectiveDate", existing.getEffectiveDate(),
+                "loansRevised", Math.max(revisedOld, revisedNew)
+        ));
+    }
+
+    @DeleteMapping("/reference-rates/{id}")
+    @PreAuthorize("hasRole('ADMIN')")
+    @Operation(summary = "Delete a reference rate (Admin only)")
+    public ResponseEntity<Map<String, Object>> deleteRate(@PathVariable UUID id) {
+        ReferenceRate rate = referenceRateRepository.findById(id)
+                .orElseThrow(() -> new NotFoundException("Taux de référence introuvable: " + id));
+
+        long ratesForIndex = referenceRateRepository.countByIndexName(rate.getIndexName());
+        boolean hasActiveVariableLoans = !loanContractRepository.findActiveVariableRateLoans(rate.getIndexName()).isEmpty();
+
+        if (ratesForIndex <= 1 && hasActiveVariableLoans) {
+            throw new BankingException("Suppression refusée: ce taux est le dernier pour l'indice "
+                    + rate.getIndexName() + " et des prêts variables actifs en dépendent");
+        }
+
+        referenceRateRepository.delete(rate);
+        int revised = loanEngineService.reviseVariableRateLoans(rate.getIndexName());
+
+        return ResponseEntity.ok(Map.of(
+                "message", "Taux de référence supprimé avec succès",
+                "deletedId", id,
+                "indexName", rate.getIndexName(),
                 "loansRevised", revised
         ));
     }
@@ -279,6 +342,49 @@ public class LoanController {
     }
 
     // ════════════════════════════════════════════════════════════
+    // GAP-F: LOAN APPLICATION (Bridge Simulation → Credit Request)
+    // ════════════════════════════════════════════════════════════
+
+    @PostMapping("/apply")
+    @Operation(summary = "Apply for a loan from simulation — creates a credit request",
+            description = "Bridges the loan simulation to the credit application flow. " +
+                          "Uses the LoanProduct's real rate (not hardcoded) to create a CreditRequest " +
+                          "that will go through the standard approval workflow.")
+    public ResponseEntity<CreditResponse> applyForLoan(
+            Authentication auth,
+            @Valid @RequestBody LoanApplicationRequest request) {
+
+        // Validate the product exists and is active
+        LoanProduct product = loanProductRepository.findByCode(request.getProductCode())
+                .orElseThrow(() -> new NotFoundException("Produit introuvable: " + request.getProductCode()));
+
+        if (!Boolean.TRUE.equals(product.getIsActive())) {
+            throw new BankingException("Ce produit de prêt n'est plus actif");
+        }
+
+        // Validate against product limits
+        if (product.getMinAmount() != null && request.getAmount().compareTo(product.getMinAmount()) < 0)
+            throw new BankingException("Montant minimum: " + product.getMinAmount() + " TND");
+        if (product.getMaxAmount() != null && request.getAmount().compareTo(product.getMaxAmount()) > 0)
+            throw new BankingException("Montant maximum: " + product.getMaxAmount() + " TND");
+        if (product.getMinDurationMonths() != null && request.getDurationMonths() < product.getMinDurationMonths())
+            throw new BankingException("Durée minimum: " + product.getMinDurationMonths() + " mois");
+        if (product.getMaxDurationMonths() != null && request.getDurationMonths() > product.getMaxDurationMonths())
+            throw new BankingException("Durée maximum: " + product.getMaxDurationMonths() + " mois");
+
+        // Convert to CreditSimulationRequest and submit through CreditService
+        CreditSimulationRequest creditRequest = new CreditSimulationRequest();
+        creditRequest.setCreditType(product.getCreditType());
+        creditRequest.setAmountRequested(request.getAmount());
+        creditRequest.setDurationMonths(request.getDurationMonths());
+        creditRequest.setPurpose(request.getPurpose() != null ? request.getPurpose()
+                : "Demande via simulation produit " + product.getName());
+
+        CreditResponse response = creditService.submit(auth.getName(), creditRequest);
+        return ResponseEntity.ok(response);
+    }
+
+    // ════════════════════════════════════════════════════════════
     // LOAN CONTRACTS
     // ════════════════════════════════════════════════════════════
 
@@ -294,35 +400,50 @@ public class LoanController {
     @GetMapping("/contracts/{id}")
     @Operation(summary = "Get loan contract details")
     public ResponseEntity<LoanContractResponse> getLoan(Authentication auth, @PathVariable UUID id) {
-        LoanContract loan = loanContractRepository.findById(id)
-                .orElseThrow(() -> new NotFoundException("Contrat introuvable"));
+        LoanContract loan = requireLoanAccess(auth, id);
+        return ResponseEntity.ok(toLoanResponse(loan));
+    }
+
+    @GetMapping("/contracts/by-credit/{creditRequestId}")
+    @Operation(summary = "Get loan contract by credit request ID")
+    public ResponseEntity<LoanContractResponse> getLoanByCreditRequest(
+            Authentication auth,
+            @PathVariable UUID creditRequestId) {
+        LoanContract loan = loanContractRepository.findByCreditRequestId(creditRequestId)
+                .orElseThrow(() -> new NotFoundException("Aucun contrat de pret lie a cette demande de credit"));
+        requireLoanAccess(auth, loan.getId());
         return ResponseEntity.ok(toLoanResponse(loan));
     }
 
     @GetMapping("/contracts/{id}/schedule")
     @Operation(summary = "Get full amortization schedule (échéancier)")
-    public ResponseEntity<List<AmortizationLineResponse>> getSchedule(@PathVariable UUID id) {
+    public ResponseEntity<List<AmortizationLineResponse>> getSchedule(Authentication auth, @PathVariable UUID id) {
+        requireLoanAccess(auth, id);
         List<AmortizationSchedule> lines = loanEngineService.getAmortizationSchedule(id);
         return ResponseEntity.ok(lines.stream().map(this::toLineResponse).toList());
     }
 
     @GetMapping("/contracts/{id}/payments")
     @Operation(summary = "Get payment history for a loan")
-    public ResponseEntity<List<LoanPayment>> getPayments(@PathVariable UUID id) {
+    public ResponseEntity<List<LoanPayment>> getPayments(Authentication auth, @PathVariable UUID id) {
+        requireLoanAccess(auth, id);
         return ResponseEntity.ok(loanEngineService.getLoanPayments(id));
     }
 
     @GetMapping("/contracts/{id}/rate-revisions")
     @Operation(summary = "Get rate revision history for a variable-rate loan")
-    public ResponseEntity<List<RateRevision>> getRevisions(@PathVariable UUID id) {
+    public ResponseEntity<List<RateRevision>> getRevisions(Authentication auth, @PathVariable UUID id) {
+        requireLoanAccess(auth, id);
         return ResponseEntity.ok(loanEngineService.getRateRevisions(id));
     }
 
     @PostMapping("/contracts/{id}/pay")
     @Operation(summary = "Make a payment on a loan")
     public ResponseEntity<Map<String, Object>> makePayment(
+            Authentication auth,
             @PathVariable UUID id,
             @RequestBody Map<String, Object> body) {
+        requireLoanAccess(auth, id);
         BigDecimal amount = new BigDecimal(body.get("amount").toString());
         LocalDate paymentDate = body.get("paymentDate") != null
                 ? LocalDate.parse(body.get("paymentDate").toString())
@@ -345,7 +466,8 @@ public class LoanController {
     @GetMapping("/contracts/{id}/early-repayment/simulate")
     @Operation(summary = "Simulate early repayment cost",
             description = "Calculates: outstanding principal + accrued interest + 2% early repayment penalty. Shows total to pay and interest saved.")
-    public ResponseEntity<Map<String, Object>> simulateEarlyRepayment(@PathVariable UUID id) {
+    public ResponseEntity<Map<String, Object>> simulateEarlyRepayment(Authentication auth, @PathVariable UUID id) {
+        requireLoanAccess(auth, id);
         return ResponseEntity.ok(loanEngineService.simulateEarlyRepayment(id));
     }
 
@@ -353,8 +475,10 @@ public class LoanController {
     @Operation(summary = "Execute early repayment — closes the loan",
             description = "Debits the full amount from the linked account and marks the loan as PAID_OFF.")
     public ResponseEntity<Map<String, Object>> executeEarlyRepayment(
+            Authentication auth,
             @PathVariable UUID id,
             @RequestBody(required = false) Map<String, Object> body) {
+        requireLoanAccess(auth, id);
         LocalDate paymentDate = body != null && body.get("paymentDate") != null
                 ? LocalDate.parse(body.get("paymentDate").toString())
                 : LocalDate.now();
@@ -373,6 +497,72 @@ public class LoanController {
     }
 
     // ════════════════════════════════════════════════════════════
+    // GAP-H: PAYMENT RECEIPT
+    // ════════════════════════════════════════════════════════════
+
+    @GetMapping("/payments/{paymentId}/receipt")
+    @Operation(summary = "Get payment receipt (proof of payment)",
+            description = "Returns a detailed receipt for a specific loan payment. " +
+                          "Includes borrower info, contract details, payment breakdown, and outstanding balance.")
+    public ResponseEntity<Map<String, Object>> getPaymentReceipt(
+            Authentication auth,
+            @PathVariable UUID paymentId) {
+
+        LoanPayment payment = loanEngineService.getPaymentById(paymentId);
+        LoanContract loan = payment.getLoanContract();
+
+        // Verify the user owns this loan
+        User user = userRepository.findByEmail(auth.getName())
+                .orElseThrow(() -> new NotFoundException("Utilisateur introuvable"));
+        if (!loan.getUser().getId().equals(user.getId())
+                && user.getUserType() != User.UserType.ADMIN
+                && user.getUserType() != User.UserType.AGENT) {
+            throw new BankingException.ForbiddenException("Ce paiement ne vous appartient pas");
+        }
+
+        Map<String, Object> receipt = new LinkedHashMap<>();
+        receipt.put("receiptNumber", "REC-" + payment.getId().toString().substring(0, 8).toUpperCase());
+        receipt.put("paymentDate", payment.getPaymentDate());
+        receipt.put("issuedAt", payment.getCreatedAt());
+
+        // Borrower info
+        Map<String, Object> borrower = new LinkedHashMap<>();
+        borrower.put("name", loan.getUser().getFullNameFr());
+        borrower.put("email", loan.getUser().getEmail());
+        receipt.put("borrower", borrower);
+
+        // Contract info
+        Map<String, Object> contract = new LinkedHashMap<>();
+        contract.put("contractNumber", loan.getContractNumber());
+        contract.put("productName", loan.getProduct().getName());
+        contract.put("principalAmount", loan.getPrincipalAmount());
+        contract.put("currentRate", loan.getCurrentRate());
+        contract.put("currency", loan.getCurrency());
+        receipt.put("contract", contract);
+
+        // Payment breakdown
+        Map<String, Object> breakdown = new LinkedHashMap<>();
+        breakdown.put("totalPaid", payment.getTotalPaid());
+        breakdown.put("principalPaid", payment.getPrincipalPaid());
+        breakdown.put("interestPaid", payment.getInterestPaid());
+        breakdown.put("penaltyPaid", payment.getPenaltyPaid());
+        breakdown.put("paymentType", payment.getPaymentType().name());
+        receipt.put("paymentBreakdown", breakdown);
+
+        // After payment
+        Map<String, Object> afterPayment = new LinkedHashMap<>();
+        afterPayment.put("outstandingPrincipal", payment.getOutstandingAfter());
+        afterPayment.put("remainingInstallments", loan.getTotalInstallments() - loan.getPaidInstallments());
+        afterPayment.put("loanStatus", loan.getStatus().name());
+        receipt.put("afterPayment", afterPayment);
+
+        receipt.put("bankName", "Amen Bank");
+        receipt.put("disclaimer", "Ce reçu est généré automatiquement par le système bancaire Amen Bank.");
+
+        return ResponseEntity.ok(receipt);
+    }
+
+    // ════════════════════════════════════════════════════════════
     // ADMIN: MANAGE PRODUCTS
     // ════════════════════════════════════════════════════════════
 
@@ -383,26 +573,69 @@ public class LoanController {
         if (loanProductRepository.existsByCode(product.getCode())) {
             throw new BankingException("Un produit avec le code " + product.getCode() + " existe déjà");
         }
+        if (loanProductRepository.existsByName(product.getName())) {
+            throw new BankingException("Un produit avec le nom " + product.getName() + " existe déjà");
+        }
+
+        validateProductConfig(product);
         loanProductRepository.save(product);
         return ResponseEntity.ok(toProductResponse(product, null, null));
     }
 
-    // ════════════════════════════════════════════════════════════
-    // PRIVATE MAPPERS
-    // ════════════════════════════════════════════════════════════
+    @PutMapping("/products/{code}")
+    @PreAuthorize("hasRole('ADMIN')")
+    @Operation(summary = "Update a loan product by code (Admin only)")
+    public ResponseEntity<LoanProductResponse> updateProduct(@PathVariable String code, @RequestBody LoanProduct request) {
+        LoanProduct existing = loanProductRepository.findByCode(code)
+                .orElseThrow(() -> new NotFoundException("Produit introuvable: " + code));
 
-    private void validateLoanRequest(LoanProduct product, LoanSimulationRequest request) {
-        if (product.getMinAmount() != null && request.getAmount().compareTo(product.getMinAmount()) < 0)
-            throw new BankingException("Montant minimum: " + product.getMinAmount() + " TND");
-        if (product.getMaxAmount() != null && request.getAmount().compareTo(product.getMaxAmount()) > 0)
-            throw new BankingException("Montant maximum: " + product.getMaxAmount() + " TND");
-        if (product.getMinDurationMonths() != null && request.getDurationMonths() < product.getMinDurationMonths())
-            throw new BankingException("Durée minimum: " + product.getMinDurationMonths() + " mois");
-        if (product.getMaxDurationMonths() != null && request.getDurationMonths() > product.getMaxDurationMonths())
-            throw new BankingException("Durée maximum: " + product.getMaxDurationMonths() + " mois");
-        int graceMonths = request.getGracePeriodMonths() != null ? request.getGracePeriodMonths() : 0;
-        if (graceMonths > product.getMaxGracePeriodMonths())
-            throw new BankingException("Période de grâce maximum: " + product.getMaxGracePeriodMonths() + " mois");
+        if (request.getCode() != null && !request.getCode().equals(code)) {
+            throw new BankingException("Le code produit est immuable. Utilisez le même code que l'URL.");
+        }
+
+        if (request.getName() != null
+                && !request.getName().equals(existing.getName())
+                && loanProductRepository.existsByNameAndIdNot(request.getName(), existing.getId())) {
+            throw new BankingException("Un produit avec le nom " + request.getName() + " existe déjà");
+        }
+
+        mergeProduct(existing, request);
+        validateProductConfig(existing);
+        loanProductRepository.save(existing);
+
+        BigDecimal currentRefRate = null;
+        BigDecimal totalRate = null;
+        if (existing.getRateType() == LoanProduct.RateType.VARIABLE && existing.getReferenceIndex() != null) {
+            currentRefRate = referenceRateRepository
+                    .findCurrentRate(existing.getReferenceIndex(), LocalDate.now())
+                    .map(ReferenceRate::getRateValue)
+                    .orElse(null);
+            if (currentRefRate != null) {
+                totalRate = currentRefRate.add(existing.getMargin());
+            }
+        } else if (existing.getFixedRate() != null) {
+            totalRate = existing.getFixedRate();
+        }
+
+        return ResponseEntity.ok(toProductResponse(existing, currentRefRate, totalRate));
+    }
+
+    @DeleteMapping("/products/{code}")
+    @PreAuthorize("hasRole('ADMIN')")
+    @Operation(summary = "Delete a loan product by code (Admin only)")
+    public ResponseEntity<Map<String, Object>> deleteProduct(@PathVariable String code) {
+        LoanProduct product = loanProductRepository.findByCode(code)
+                .orElseThrow(() -> new NotFoundException("Produit introuvable: " + code));
+
+        if (loanContractRepository.existsByProductId(product.getId())) {
+            throw new BankingException("Suppression refusée: ce produit est déjà lié à au moins un contrat de prêt");
+        }
+
+        loanProductRepository.delete(product);
+        return ResponseEntity.ok(Map.of(
+                "message", "Produit supprimé avec succès",
+                "code", code
+        ));
     }
 
     private LoanProductResponse toProductResponse(LoanProduct p, BigDecimal currentRefRate, BigDecimal totalRate) {
@@ -451,6 +684,7 @@ public class LoanController {
                 .repaymentFrequency(product.getRepaymentFrequency().name())
                 .userName(loan.getUser().getFullNameFr())
                 .userEmail(loan.getUser().getEmail())
+                .creditRequestId(loan.getCreditRequest() != null ? loan.getCreditRequest().getId() : null)
                 .createdAt(loan.getCreatedAt())
                 .build();
     }
@@ -469,5 +703,157 @@ public class LoanController {
                 .penaltyAmount(line.getPenaltyAmount())
                 .build();
     }
-}
 
+    private LoanContract requireLoanAccess(Authentication auth, UUID loanId) {
+        LoanContract loan = loanContractRepository.findById(loanId)
+                .orElseThrow(() -> new NotFoundException("Contrat introuvable"));
+
+        User actor = userRepository.findByEmail(auth.getName())
+                .orElseThrow(() -> new NotFoundException("Utilisateur introuvable"));
+
+        boolean isOwner = loan.getUser().getId().equals(actor.getId());
+        boolean isStaff = actor.getUserType() == User.UserType.ADMIN || actor.getUserType() == User.UserType.AGENT;
+        if (!isOwner && !isStaff) {
+            throw new BankingException.ForbiddenException("Acces refuse a ce contrat de pret");
+        }
+
+        if (actor.getUserType() == User.UserType.AGENT) {
+            UUID agentAgencyId = actor.getAgency() != null ? actor.getAgency().getId() : null;
+            UUID borrowerAgencyId = loan.getUser().getAgency() != null ? loan.getUser().getAgency().getId() : null;
+            if (agentAgencyId == null || borrowerAgencyId == null || !agentAgencyId.equals(borrowerAgencyId)) {
+                throw new BankingException.ForbiddenException("Acces agence refuse pour ce contrat de pret");
+            }
+        }
+
+        return loan;
+    }
+
+    private void validateLoanRequest(LoanProduct product, LoanSimulationRequest request) {
+        if (product.getMinAmount() != null && request.getAmount().compareTo(product.getMinAmount()) < 0)
+            throw new BankingException("Montant minimum: " + product.getMinAmount() + " TND");
+        if (product.getMaxAmount() != null && request.getAmount().compareTo(product.getMaxAmount()) > 0)
+            throw new BankingException("Montant maximum: " + product.getMaxAmount() + " TND");
+        if (product.getMinDurationMonths() != null && request.getDurationMonths() < product.getMinDurationMonths())
+            throw new BankingException("Durée minimum: " + product.getMinDurationMonths() + " mois");
+        if (product.getMaxDurationMonths() != null && request.getDurationMonths() > product.getMaxDurationMonths())
+            throw new BankingException("Durée maximum: " + product.getMaxDurationMonths() + " mois");
+        int graceMonths = request.getGracePeriodMonths() != null ? request.getGracePeriodMonths() : 0;
+        if (graceMonths > product.getMaxGracePeriodMonths())
+            throw new BankingException("Période de grâce maximum: " + product.getMaxGracePeriodMonths() + " mois");
+    }
+
+    private void validateReferenceRate(ReferenceRate rate) {
+        if (rate.getIndexName() == null || rate.getIndexName().isBlank()) {
+            throw new BankingException("indexName est obligatoire");
+        }
+        if (rate.getRateValue() == null) {
+            throw new BankingException("rateValue est obligatoire");
+        }
+        if (rate.getRateValue().compareTo(BigDecimal.ZERO) < 0) {
+            throw new BankingException("rateValue doit être positif");
+        }
+        if (rate.getEffectiveDate() == null) {
+            throw new BankingException("effectiveDate est obligatoire");
+        }
+    }
+
+    private void mergeProduct(LoanProduct target, LoanProduct source) {
+        if (source.getName() != null) target.setName(source.getName());
+        if (source.getCreditType() != null) target.setCreditType(source.getCreditType());
+        if (source.getRateType() != null) target.setRateType(source.getRateType());
+        if (source.getReferenceIndex() != null) target.setReferenceIndex(source.getReferenceIndex());
+        if (source.getMargin() != null) target.setMargin(source.getMargin());
+        if (source.getFixedRate() != null) target.setFixedRate(source.getFixedRate());
+        if (source.getFloorRate() != null) target.setFloorRate(source.getFloorRate());
+        if (source.getCeilingRate() != null) target.setCeilingRate(source.getCeilingRate());
+        if (source.getDayCountConvention() != null) target.setDayCountConvention(source.getDayCountConvention());
+        if (source.getRepaymentFrequency() != null) target.setRepaymentFrequency(source.getRepaymentFrequency());
+        if (source.getInterestMethod() != null) target.setInterestMethod(source.getInterestMethod());
+        if (source.getMinAmount() != null) target.setMinAmount(source.getMinAmount());
+        if (source.getMaxAmount() != null) target.setMaxAmount(source.getMaxAmount());
+        if (source.getMinDurationMonths() != null) target.setMinDurationMonths(source.getMinDurationMonths());
+        if (source.getMaxDurationMonths() != null) target.setMaxDurationMonths(source.getMaxDurationMonths());
+        if (source.getMaxGracePeriodMonths() != null) target.setMaxGracePeriodMonths(source.getMaxGracePeriodMonths());
+        if (source.getPenaltyMargin() != null) target.setPenaltyMargin(source.getPenaltyMargin());
+        if (source.getIsActive() != null) target.setIsActive(source.getIsActive());
+    }
+
+    private void validateProductConfig(LoanProduct product) {
+        if (product.getName() == null || product.getName().isBlank()) {
+            throw new BankingException("name est obligatoire");
+        }
+        if (product.getCode() == null || product.getCode().isBlank()) {
+            throw new BankingException("code est obligatoire");
+        }
+        if (product.getCreditType() == null) {
+            throw new BankingException("creditType est obligatoire");
+        }
+        if (product.getRateType() == null) {
+            throw new BankingException("rateType est obligatoire");
+        }
+        if (product.getRateType() == LoanProduct.RateType.FIXED && product.getFixedRate() == null) {
+            throw new BankingException("fixedRate est obligatoire pour un produit a taux fixe");
+        }
+        if (product.getRateType() == LoanProduct.RateType.VARIABLE) {
+            if (product.getReferenceIndex() == null || product.getReferenceIndex().isBlank()) {
+                throw new BankingException("referenceIndex est obligatoire pour un produit a taux variable");
+            }
+            if (product.getMargin() == null) {
+                throw new BankingException("margin est obligatoire pour un produit a taux variable");
+            }
+        }
+        if (product.getMinAmount() != null && product.getMaxAmount() != null
+                && product.getMinAmount().compareTo(product.getMaxAmount()) > 0) {
+            throw new BankingException("minAmount doit etre inferieur ou egal a maxAmount");
+        }
+        if (product.getMinDurationMonths() != null && product.getMaxDurationMonths() != null
+                && product.getMinDurationMonths() > product.getMaxDurationMonths()) {
+            throw new BankingException("minDurationMonths doit etre inferieur ou egal a maxDurationMonths");
+        }
+        if (product.getFloorRate() != null && product.getCeilingRate() != null
+                && product.getFloorRate().compareTo(product.getCeilingRate()) > 0) {
+            throw new BankingException("floorRate doit etre inferieur ou egal a ceilingRate");
+        }
+    }
+
+    private String readRequiredString(Map<String, Object> body, String key) {
+        Object raw = body != null ? body.get(key) : null;
+        if (raw == null || raw.toString().isBlank()) {
+            throw new BankingException(key + " est obligatoire");
+        }
+        return raw.toString().trim();
+    }
+
+    private String readOptionalString(Map<String, Object> body, String key, String defaultValue) {
+        Object raw = body != null ? body.get(key) : null;
+        if (raw == null || raw.toString().isBlank()) {
+            return defaultValue;
+        }
+        return raw.toString().trim();
+    }
+
+    private BigDecimal readRequiredBigDecimal(Map<String, Object> body, String key) {
+        Object raw = body != null ? body.get(key) : null;
+        if (raw == null) {
+            throw new BankingException(key + " est obligatoire");
+        }
+        try {
+            return new BigDecimal(raw.toString().trim());
+        } catch (NumberFormatException ex) {
+            throw new BankingException(key + " invalide: format numérique attendu");
+        }
+    }
+
+    private LocalDate readOptionalDate(Map<String, Object> body, String key, LocalDate defaultValue) {
+        Object raw = body != null ? body.get(key) : null;
+        if (raw == null || raw.toString().isBlank()) {
+            return defaultValue;
+        }
+        try {
+            return LocalDate.parse(raw.toString().trim());
+        } catch (java.time.format.DateTimeParseException ex) {
+            throw new BankingException(key + " invalide: format attendu yyyy-MM-dd");
+        }
+    }
+
+}

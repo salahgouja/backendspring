@@ -55,6 +55,7 @@ public class AuditLog {
         USER_LOGIN_FAILED,
         USER_LOGOUT,
         PASSWORD_CHANGED,
+        PASSWORD_RESET_REQUESTED,
         TWO_FA_ENABLED,
         TWO_FA_DISABLED,
 
@@ -87,10 +88,8 @@ public class AuditLog {
         LOAN_RATE_REVISED,
         LOAN_DEFAULTED,
         LOAN_PAID_OFF,
-
-        // Fraud
-        FRAUD_ALERT_CREATED,
-        FRAUD_ALERT_RESOLVED
+        LOAN_AUTO_COLLECTED,
+        LOAN_EARLY_REPAYMENT
     }
 }
 

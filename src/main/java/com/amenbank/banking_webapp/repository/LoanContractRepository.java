@@ -1,6 +1,7 @@
 package com.amenbank.banking_webapp.repository;
 
 import com.amenbank.banking_webapp.model.LoanContract;
+import org.springframework.data.jpa.repository.EntityGraph;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -15,6 +16,7 @@ public interface LoanContractRepository extends JpaRepository<LoanContract, UUID
 
     Optional<LoanContract> findByContractNumber(String contractNumber);
 
+    @EntityGraph(attributePaths = {"product", "user", "user.agency"})
     List<LoanContract> findByUserIdOrderByCreatedAtDesc(UUID userId);
 
     List<LoanContract> findByStatusOrderByCreatedAtDesc(LoanContract.LoanStatus status);
@@ -30,5 +32,12 @@ public interface LoanContractRepository extends JpaRepository<LoanContract, UUID
     List<LoanContract> findAllActiveLoans();
 
     boolean existsByContractNumber(String contractNumber);
-}
 
+    /** GAP-C: Find loan contract linked to a credit request */
+    Optional<LoanContract> findByCreditRequestId(UUID creditRequestId);
+
+    boolean existsByProductId(UUID productId);
+
+    @EntityGraph(attributePaths = {"product", "user", "user.agency"})
+    Optional<LoanContract> findById(UUID id);
+}

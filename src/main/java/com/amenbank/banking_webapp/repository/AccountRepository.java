@@ -18,6 +18,8 @@ public interface AccountRepository extends JpaRepository<Account, UUID> {
 
     Optional<Account> findByAccountNumber(String accountNumber);
 
+    Optional<Account> findByAccountType(Account.AccountType accountType);
+
     List<Account> findByUserIdAndIsActiveTrue(UUID userId);
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
@@ -47,4 +49,11 @@ public interface AccountRepository extends JpaRepository<Account, UUID> {
 
     @Query("SELECT a FROM Account a JOIN a.user u WHERE u.agency.id = :agencyId AND a.status IN :statuses ORDER BY a.createdAt DESC")
     List<Account> findByUserAgencyIdAndStatusIn(UUID agencyId, List<Account.AccountStatus> statuses);
+
+    // BUG-6: Efficient count queries for dashboard
+    @Query("SELECT COUNT(a) FROM Account a JOIN a.user u WHERE u.agency.id = :agencyId AND a.status = :status")
+    long countByUserAgencyIdAndStatus(UUID agencyId, Account.AccountStatus status);
+
+    @Query("SELECT COUNT(a) FROM Account a JOIN a.user u WHERE u.agency.id = :agencyId AND a.status IN :statuses")
+    long countByUserAgencyIdAndStatusIn(UUID agencyId, List<Account.AccountStatus> statuses);
 }

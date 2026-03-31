@@ -1,6 +1,7 @@
 package com.amenbank.banking_webapp.repository;
 
 import com.amenbank.banking_webapp.model.ReferenceRate;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -16,8 +17,14 @@ public interface ReferenceRateRepository extends JpaRepository<ReferenceRate, UU
 
     /** Get the most recent rate for a given index as of a date */
     @Query("SELECT r FROM ReferenceRate r WHERE r.indexName = :indexName AND r.effectiveDate <= :asOf " +
-           "ORDER BY r.effectiveDate DESC LIMIT 1")
-    Optional<ReferenceRate> findCurrentRate(@Param("indexName") String indexName, @Param("asOf") LocalDate asOf);
+           "ORDER BY r.effectiveDate DESC")
+    List<ReferenceRate> findCurrentRateCandidates(@Param("indexName") String indexName, @Param("asOf") LocalDate asOf,
+                                                  org.springframework.data.domain.Pageable pageable);
+
+    default Optional<ReferenceRate> findCurrentRate(String indexName, LocalDate asOf) {
+        List<ReferenceRate> rates = findCurrentRateCandidates(indexName, asOf, PageRequest.of(0, 1));
+        return rates.stream().findFirst();
+    }
 
     /** History of rate changes for an index */
     List<ReferenceRate> findByIndexNameOrderByEffectiveDateDesc(String indexName);
@@ -25,5 +32,6 @@ public interface ReferenceRateRepository extends JpaRepository<ReferenceRate, UU
     /** All distinct index names */
     @Query("SELECT DISTINCT r.indexName FROM ReferenceRate r ORDER BY r.indexName")
     List<String> findDistinctIndexNames();
-}
 
+    long countByIndexName(String indexName);
+}

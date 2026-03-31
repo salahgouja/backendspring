@@ -4,12 +4,10 @@ import com.amenbank.banking_webapp.model.User;
 import com.amenbank.banking_webapp.repository.UserRepository;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
-import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
-import org.springframework.cache.annotation.Cacheable;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.security.core.userdetails.UserDetailsService;
@@ -39,7 +37,7 @@ public class UserDetailsServiceImpl implements UserDetailsService {
     private final CacheManager cacheManager;
     
     // Fallback cache if Spring cache not available
-    private final ConcurrentHashMap<String, UserCacheEntry> localCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, UserDetailsCacheEntry> localCache = new ConcurrentHashMap<>();
 
     // ============================================================
     // Bean Life Cycle - @PostConstruct
@@ -65,62 +63,59 @@ public class UserDetailsServiceImpl implements UserDetailsService {
     @Override
     public UserDetails loadUserByUsername(String email) throws UsernameNotFoundException {
         log.debug("{}: Loading user by email: {}", BEAN_NAME, email);
-        
-        // Try Spring cache first
-        User user = getCachedUser(email);
-        
-        if (user == null) {
-            user = userRepository.findByEmail(email)
-                    .orElseThrow(() -> {
-                        log.warn("{}: User not found with email: {}", BEAN_NAME, email);
-                        return new UsernameNotFoundException("User not found with email: " + email);
-                    });
-            
-            // Cache the user
-            cacheUser(email, user);
+
+        UserDetails cached = getCachedUserDetails(email);
+        if (cached != null) {
+            return cached;
         }
 
-        return buildUserDetails(user);
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> {
+                    log.warn("{}: User not found with email: {}", BEAN_NAME, email);
+                    return new UsernameNotFoundException("User not found with email: " + email);
+                });
+
+        UserDetails userDetails = buildUserDetails(user);
+        cacheUserDetails(email, userDetails);
+        return userDetails;
     }
 
     // ============================================================
     // Cache Management
     // ============================================================
-    @Cacheable(value = CACHE_NAME, key = "#email", unless = "#result == null")
-    public User getCachedUser(String email) {
-        // This method is only invoked if @Cacheable works
-        // Fallback to local cache
+    public UserDetails getCachedUserDetails(String email) {
+        // Local fallback cache is checked first to avoid unnecessary repository hits.
         return getFromLocalCache(email);
     }
 
-    private void cacheUser(String email, User user) {
+    private void cacheUserDetails(String email, UserDetails userDetails) {
         // Try Spring cache first
         try {
             Cache cache = cacheManager.getCache(CACHE_NAME);
             if (cache != null) {
-                cache.put(email, user);
-                log.debug("{}: User cached in Spring cache: {}", BEAN_NAME, email);
+                cache.put(email, userDetails);
+                log.debug("{}: UserDetails cached in Spring cache: {}", BEAN_NAME, email);
                 return;
             }
         } catch (Exception e) {
             log.debug("{}: Spring cache not available, using local cache", BEAN_NAME);
         }
-        
+
         // Fallback to local cache
-        localCache.put(email, new UserCacheEntry(user, System.currentTimeMillis() + 300_000)); // 5 min TTL
-        log.debug("{}: User cached locally: {}", BEAN_NAME, email);
+        localCache.put(email, new UserDetailsCacheEntry(userDetails, System.currentTimeMillis() + 300_000)); // 5 min TTL
+        log.debug("{}: UserDetails cached locally: {}", BEAN_NAME, email);
     }
 
-    private User getFromLocalCache(String email) {
-        UserCacheEntry entry = localCache.get(email);
+    private UserDetails getFromLocalCache(String email) {
+        UserDetailsCacheEntry entry = localCache.get(email);
         if (entry != null) {
             if (entry.isExpired()) {
                 localCache.remove(email);
                 log.debug("{}: Expired cache entry removed for: {}", BEAN_NAME, email);
                 return null;
             }
-            log.debug("{}: User found in local cache: {}", BEAN_NAME, email);
-            return entry.getUser();
+            log.debug("{}: UserDetails found in local cache: {}", BEAN_NAME, email);
+            return entry.getUserDetails();
         }
         return null;
     }
@@ -165,17 +160,17 @@ public class UserDetailsServiceImpl implements UserDetailsService {
     // ============================================================
     // Local Cache Entry Class
     // ============================================================
-    private static class UserCacheEntry {
-        private final User user;
+    private static class UserDetailsCacheEntry {
+        private final UserDetails userDetails;
         private final long expiresAt;
 
-        public UserCacheEntry(User user, long expiresAt) {
-            this.user = user;
+        public UserDetailsCacheEntry(UserDetails userDetails, long expiresAt) {
+            this.userDetails = userDetails;
             this.expiresAt = expiresAt;
         }
 
-        public User getUser() {
-            return user;
+        public UserDetails getUserDetails() {
+            return userDetails;
         }
 
         public boolean isExpired() {

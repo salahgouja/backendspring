@@ -23,6 +23,8 @@ import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.UrlResource;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.authentication.DisabledException;
@@ -32,10 +34,21 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.util.HtmlUtils;
 
 import java.math.BigDecimal;
+import java.io.IOException;
+import java.net.URLEncoder;
+import java.net.MalformedURLException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -48,9 +61,13 @@ public class AuthService {
     private static final String BEAN_NAME = "AuthService";
     private static final Pattern PASSWORD_PATTERN = Pattern.compile(
             "^(?=.*[0-9])(?=.*[a-z])(?=.*[A-Z])(?=.*[@#$%^&+=])(?=\\S+$).{8,}$");
-    private static final String ACCOUNT_PREFIX = "AMEN";
     private static final int MAX_FAILED_ATTEMPTS = 5;
     private static final int LOCK_DURATION_MINUTES = 30;
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+    private static final HashingAlgorithm TOTP_ALGORITHM = HashingAlgorithm.SHA1;
+    private static final int TOTP_DIGITS = 6;
+    private static final int TOTP_PERIOD_SECONDS = 30;
+    private static final int TOTP_ALLOWED_TIME_STEPS = 1;
 
     private final UserRepository userRepository;
     private final AccountRepository accountRepository;
@@ -63,13 +80,21 @@ public class AuthService {
     private final UserDetailsServiceImpl userDetailsService;
     private final com.amenbank.banking_webapp.repository.PasswordResetTokenRepository passwordResetTokenRepository;
     private final EmailService emailService;
+    private final AccountNumberGenerator accountNumberGenerator;
 
     @Value("${app.security.min-password-length:8}")
     private int minPasswordLength;
+    @Value("${app.upload.profile-images-dir:./uploads/profile-images}")
+    private String profileImagesDir;
 
     @PostConstruct
     public void init() {
         log.info("=== {}: PostConstruct - Auth Service initialized ===", BEAN_NAME);
+        try {
+            Files.createDirectories(Paths.get(profileImagesDir).toAbsolutePath().normalize());
+        } catch (IOException e) {
+            throw new IllegalStateException("Cannot initialize profile images directory", e);
+        }
     }
 
     @PreDestroy
@@ -140,6 +165,7 @@ public class AuthService {
                         .userId(user.getId())
                         .email(user.getEmail())
                         .fullName(user.getFullNameFr())
+                        .profileImageUrl(user.getProfileImageUrl())
                         .userType(user.getUserType())
                         .is2faEnabled(true)
                         .requires2fa(true)
@@ -178,13 +204,20 @@ public class AuthService {
         }
 
         SecretGenerator secretGenerator = new DefaultSecretGenerator();
-        String secret = secretGenerator.generate();
+        String secret = normalizeTotpSecret(secretGenerator.generate());
         user.setTotpSecret(secret);
         userRepository.save(user);
 
+        String issuer = "AmenBank";
+        String label = issuer + ":" + email;
         String otpAuthUrl = String.format(
-                "otpauth://totp/AmenBank:%s?secret=%s&issuer=AmenBank",
-                email, secret);
+                "otpauth://totp/%s?secret=%s&issuer=%s&algorithm=%s&digits=%d&period=%d",
+                urlEncode(label),
+                secret,
+                urlEncode(issuer),
+                TOTP_ALGORITHM.name(),
+                TOTP_DIGITS,
+                TOTP_PERIOD_SECONDS);
 
         return Map.of("secret", secret, "otpAuthUrl", otpAuthUrl);
     }
@@ -371,6 +404,12 @@ public class AuthService {
         if (request.getFullNameFr() != null && !request.getFullNameFr().isBlank()) {
             user.setFullNameFr(sanitize(request.getFullNameFr()));
         }
+        if (request.getProfileImageUrl() != null) {
+            String imageUrl = request.getProfileImageUrl().trim();
+            if (!imageUrl.isEmpty()) {
+                user.setProfileImageUrl(sanitize(imageUrl));
+            }
+        }
 
         userRepository.save(user);
         userDetailsService.invalidateCache(email);
@@ -387,6 +426,65 @@ public class AuthService {
         return toProfileResponse(user);
     }
 
+    @Transactional
+    public Map<String, String> uploadProfileImage(String email, MultipartFile file) {
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new BankingException.NotFoundException("Utilisateur introuvable"));
+
+        if (file == null || file.isEmpty()) {
+            throw new BankingException("Fichier image requis");
+        }
+        if (file.getSize() > 2 * 1024 * 1024L) {
+            throw new BankingException("Image trop volumineuse (max 2MB)");
+        }
+
+        String contentType = file.getContentType() == null ? "" : file.getContentType().toLowerCase(Locale.ROOT);
+        if (!contentType.startsWith("image/")) {
+            throw new BankingException("Type de fichier non supporte");
+        }
+
+        String extension = resolveExtension(contentType, file.getOriginalFilename());
+        String storedName = user.getId() + "_" + UUID.randomUUID() + extension;
+        Path targetDir = Paths.get(profileImagesDir).toAbsolutePath().normalize();
+        Path targetPath = targetDir.resolve(storedName).normalize();
+
+        if (!targetPath.startsWith(targetDir)) {
+            throw new BankingException("Nom de fichier invalide");
+        }
+
+        try {
+            Files.createDirectories(targetDir);
+            file.transferTo(targetPath.toFile());
+        } catch (IOException e) {
+            throw new BankingException("Erreur lors de l'enregistrement de l'image");
+        }
+
+        String publicUrl = "/auth/profile-images/" + storedName;
+        user.setProfileImageUrl(publicUrl);
+        userRepository.save(user);
+        userDetailsService.invalidateCache(email);
+
+        return Map.of("profileImageUrl", publicUrl);
+    }
+
+    @Transactional(readOnly = true)
+    public Resource loadProfileImage(String fileName) {
+        if (fileName == null || fileName.contains("..") || fileName.contains("/") || fileName.contains("\\")) {
+            throw new BankingException.NotFoundException("Image introuvable");
+        }
+
+        Path path = Paths.get(profileImagesDir).toAbsolutePath().normalize().resolve(fileName).normalize();
+        try {
+            Resource resource = new UrlResource(path.toUri());
+            if (!resource.exists() || !resource.isReadable()) {
+                throw new BankingException.NotFoundException("Image introuvable");
+            }
+            return resource;
+        } catch (MalformedURLException e) {
+            throw new BankingException.NotFoundException("Image introuvable");
+        }
+    }
+
     // ============================================================
     // Private — Brute-Force Protection (fix #4)
     // ============================================================
@@ -397,8 +495,11 @@ public class AuthService {
                     String.format("Compte verrouillé suite à trop de tentatives. Réessayez dans %d minutes.", minutesLeft + 1));
         }
     }
-    //@Transactional (making error )
-    private void handleFailedLogin(String email) {
+    /**
+     * SEC-5 fix: Method is package-private to allow Spring AOP transactional proxying.
+     * Called within login's @Transactional context.
+     */
+    void handleFailedLogin(String email) {
         userRepository.findByEmail(email).ifPresent(user -> {
             int attempts = user.getFailedLoginAttempts() + 1;
             user.setFailedLoginAttempts(attempts);
@@ -417,9 +518,45 @@ public class AuthService {
     // Private — TOTP Verification
     // ============================================================
     private boolean verifyTotpCode(String secret, String code) {
-        CodeVerifier verifier = new DefaultCodeVerifier(
-                new DefaultCodeGenerator(), new SystemTimeProvider());
-        return verifier.isValidCode(secret, code);
+        if (secret == null || secret.isBlank() || code == null || code.isBlank()) {
+            return false;
+        }
+
+        CodeVerifier verifier = buildTotpVerifier();
+        return verifier.isValidCode(normalizeTotpSecret(secret), normalizeTotpCode(code));
+    }
+
+    private CodeVerifier buildTotpVerifier() {
+        DefaultCodeVerifier verifier = new DefaultCodeVerifier(
+                new DefaultCodeGenerator(TOTP_ALGORITHM, TOTP_DIGITS),
+                new SystemTimeProvider());
+        verifier.setTimePeriod(TOTP_PERIOD_SECONDS);
+        verifier.setAllowedTimePeriodDiscrepancy(TOTP_ALLOWED_TIME_STEPS);
+        return verifier;
+    }
+
+    private String normalizeTotpSecret(String secret) {
+        return secret == null ? null : secret.replace(" ", "").toUpperCase(Locale.ROOT);
+    }
+
+    private String normalizeTotpCode(String code) {
+        return code == null ? null : code.replaceAll("\\s+", "");
+    }
+
+    private String urlEncode(String value) {
+        return URLEncoder.encode(value, StandardCharsets.UTF_8);
+    }
+
+    private String resolveExtension(String contentType, String originalName) {
+        if ("image/jpeg".equals(contentType)) return ".jpg";
+        if ("image/png".equals(contentType)) return ".png";
+        if ("image/webp".equals(contentType)) return ".webp";
+        if ("image/gif".equals(contentType)) return ".gif";
+        if (originalName != null && originalName.contains(".")) {
+            String ext = originalName.substring(originalName.lastIndexOf('.')).toLowerCase(Locale.ROOT);
+            if (ext.matches("\\.(jpg|jpeg|png|webp|gif)$")) return ext.equals(".jpeg") ? ".jpg" : ext;
+        }
+        return ".img";
     }
 
     // ============================================================
@@ -477,6 +614,7 @@ public class AuthService {
                 .fullNameAr(sanitize(request.getFullNameAr()))
                 .fullNameFr(sanitize(request.getFullNameFr()))
                 .cin(sanitize(request.getCin()))
+                .profileImageUrl(null)
                 .userType(request.getUserType())
                 .agency(agency)
                 .isActive(true)
@@ -489,7 +627,7 @@ public class AuthService {
     private Account createDefaultAccount(User user) {
         Account defaultAccount = Account.builder()
                 .user(user)
-                .accountNumber(generateAccountNumber())
+                .accountNumber(accountNumberGenerator.generate())
                 .accountType(user.getUserType() == User.UserType.COMMERCANT
                         ? Account.AccountType.COMMERCIAL
                         : Account.AccountType.COURANT)
@@ -516,24 +654,10 @@ public class AuthService {
         }
     }
 
-    private synchronized String generateAccountNumber() {
-        String accountNumber;
-        int attempts = 0;
-        do {
-            accountNumber = ACCOUNT_PREFIX + String.format("%012d",
-                    Math.abs(UUID.randomUUID().getLeastSignificantBits() % 1_000_000_000_000L));
-            attempts++;
-        } while (accountRepository.findByAccountNumber(accountNumber).isPresent() && attempts < 10);
-        if (attempts >= 10) {
-            throw new BankingException("Erreur lors de la génération du numéro de compte");
-        }
-        return accountNumber;
-    }
-
-    /** Sanitize input to prevent XSS (fix #32) */
+    /** Sanitize input to prevent XSS — uses HTML encoding instead of stripping (SEC-6 fix) */
     private String sanitize(String input) {
         if (input == null) return null;
-        return input.replaceAll("[<>\"'&]", "");
+        return HtmlUtils.htmlEscape(input);
     }
 
     private AuthResponse buildAuthResponse(User user, String accessToken, String refreshToken) {
@@ -544,6 +668,7 @@ public class AuthService {
                 .userId(user.getId())
                 .email(user.getEmail())
                 .fullName(user.getFullNameFr())
+                .profileImageUrl(user.getProfileImageUrl())
                 .userType(user.getUserType())
                 .is2faEnabled(user.getIs2faEnabled())
                 .requires2fa(false)
@@ -558,6 +683,7 @@ public class AuthService {
                 .fullNameAr(user.getFullNameAr())
                 .fullNameFr(user.getFullNameFr())
                 .cin(user.getCin())
+                .profileImageUrl(user.getProfileImageUrl())
                 .userType(user.getUserType())
                 .isActive(user.getIsActive())
                 .is2faEnabled(user.getIs2faEnabled())
@@ -587,8 +713,8 @@ public class AuthService {
                     "Si cette adresse email est enregistrée, un code de réinitialisation a été envoyé.");
         }
 
-        // Generate 6-digit OTP
-        String otpCode = String.format("%06d", new java.util.Random().nextInt(999999));
+        // Generate 6-digit OTP using SecureRandom (SEC-2 fix)
+        String otpCode = String.format("%06d", SECURE_RANDOM.nextInt(999999));
 
         // Expire old tokens
         passwordResetTokenRepository.findActiveTokenByEmail(email, LocalDateTime.now())
@@ -618,14 +744,15 @@ public class AuthService {
         // GAP-23: Send OTP via email
         emailService.sendPasswordResetOtp(user.getEmail(), otpCode);
 
-        auditService.log(AuditLog.AuditAction.PASSWORD_CHANGED, email,
+        // BUG-4 fix: Use PASSWORD_RESET_REQUESTED instead of PASSWORD_CHANGED
+        auditService.log(AuditLog.AuditAction.PASSWORD_RESET_REQUESTED, email,
                 "User", user.getId().toString(), "Password reset OTP requested");
 
         log.info("{}: Password reset OTP generated for user: {}", BEAN_NAME, email);
 
+        // SEC-1 fix: Never return OTP in response — it's sent via email/notification only
         return Map.of(
-                "message", "Si cette adresse email est enregistrée, un code de réinitialisation a été envoyé.",
-                "otpCode", otpCode // REMOVE IN PRODUCTION — only for dev/testing via Swagger
+                "message", "Si cette adresse email est enregistrée, un code de réinitialisation a été envoyé."
         );
     }
 

@@ -88,7 +88,8 @@ public class SecurityConfig {
                                                 // ── Public endpoints (no auth required) ──────
                                                 .requestMatchers("/auth/register", "/auth/login",
                                                                 "/auth/refresh", "/auth/2fa/verify",
-                                                                "/auth/forgot-password", "/auth/reset-password")
+                                                                "/auth/forgot-password", "/auth/reset-password",
+                                                                "/auth/profile-images/**")
                                                 .permitAll()
                                                 .requestMatchers("/agencies/**").permitAll()
                                                 .requestMatchers("/swagger-ui/**", "/api-docs/**", "/v3/api-docs/**")
@@ -97,11 +98,11 @@ public class SecurityConfig {
 
                                                 // ── Admin-only endpoints ──────────────────────
                                                 .requestMatchers("/admin/agent/**").hasAnyRole("AGENT", "ADMIN")
+                                                .requestMatchers("/admin/audit-logs/mine").hasAnyRole("AGENT", "ADMIN")
                                                 .requestMatchers("/admin/**").hasRole("ADMIN")
 
                                                 // ── Agent + Admin endpoints ───────────────────
                                                 .requestMatchers("/agent/**").hasAnyRole("AGENT", "ADMIN")
-                                                .requestMatchers("/fraud-alerts/**").hasAnyRole("AGENT", "ADMIN")
 
                                                 // ── All other endpoints require authentication ─
                                                 .anyRequest().authenticated())
@@ -139,6 +140,12 @@ public class SecurityConfig {
 
                                 // Add JWT filter before username/password filter
                                 .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)
+
+                                // SEC-11: HSTS headers for HTTPS enforcement
+                                .headers(headers -> headers
+                                                .httpStrictTransportSecurity(hsts -> hsts
+                                                                .includeSubDomains(true)
+                                                                .maxAgeInSeconds(31536000)))
 
                                 // Configure authentication provider
                                 .authenticationProvider(authenticationProvider());

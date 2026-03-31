@@ -66,7 +66,8 @@ public class Account {
     public enum AccountType {
         COURANT, // Current account
         EPARGNE, // Savings account
-        COMMERCIAL // Business account (for merchants)
+        COMMERCIAL, // Business account
+        TREASURY // Internal bank treasury account
     }
 
     public enum AccountStatus {

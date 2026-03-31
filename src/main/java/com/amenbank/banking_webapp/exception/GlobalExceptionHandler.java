@@ -11,15 +11,17 @@ import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 import java.time.LocalDateTime;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
  * Catches all exceptions and returns a clean JSON error response.
- * Without this, Spring Security swallows exceptions as 403/500 with no body.
+ * Without this, Spring Security swallows exceptions as 403/500
  */
 @RestControllerAdvice
 @Slf4j
@@ -90,13 +92,47 @@ public class GlobalExceptionHandler {
                 "Erreur interne du serveur: " + ex.getMessage());
     }
 
+    // ── 400 — Request param type mismatch (e.g., invalid enum) ──
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<Map<String, Object>> handleTypeMismatch(MethodArgumentTypeMismatchException ex) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("parameter", ex.getName());
+        details.put("rejectedValue", ex.getValue());
+
+        Class<?> requiredType = ex.getRequiredType();
+        String message;
+
+        if (requiredType != null && requiredType.isEnum()) {
+            String allowedValues = Arrays.stream(requiredType.getEnumConstants())
+                    .map(Object::toString)
+                    .collect(Collectors.joining(", "));
+            details.put("allowedValues", allowedValues);
+            message = "Valeur invalide pour le parametre '" + ex.getName() + "'. " +
+                    "Valeurs autorisees: " + allowedValues;
+        } else {
+            String expectedType = requiredType != null ? requiredType.getSimpleName() : "type attendu";
+            details.put("expectedType", expectedType);
+            message = "Valeur invalide pour le parametre '" + ex.getName() +
+                    "'. Type attendu: " + expectedType;
+        }
+
+        return buildResponse(HttpStatus.BAD_REQUEST, message, details);
+    }
+
     // ── Build JSON response ────────────────────────────────
     private ResponseEntity<Map<String, Object>> buildResponse(HttpStatus status, String message) {
+        return buildResponse(status, message, null);
+    }
+
+    private ResponseEntity<Map<String, Object>> buildResponse(HttpStatus status, String message, Map<String, Object> details) {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("timestamp", LocalDateTime.now().toString());
         body.put("status", status.value());
         body.put("error", status.getReasonPhrase());
         body.put("message", message);
+        if (details != null && !details.isEmpty()) {
+            body.put("details", details);
+        }
         return ResponseEntity.status(status).body(body);
     }
 }

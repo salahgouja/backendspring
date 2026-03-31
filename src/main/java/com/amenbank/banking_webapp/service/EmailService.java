@@ -21,7 +21,7 @@ public class EmailService {
 
     private final JavaMailSender mailSender;
 
-    @Value("${spring.mail.username:noreply@amenbank.com.tn}")
+    @Value("${spring.mail.username:}")
     private String fromAddress;
 
     @Value("${app.email.enabled:false}")
