@@ -34,6 +34,7 @@ public class JwtTokenProvider {
     // Bean Life Cycle - Constants
     // ============================================================
     private static final String BEAN_NAME = "JwtTokenProvider";
+    private static final String ISSUER = "amenbank-api";
     private static final int PARSER_CACHE_SIZE = 100;
     private static final long CLEANUP_INTERVAL_MINUTES = 5;
 
@@ -80,8 +81,8 @@ public class JwtTokenProvider {
         // Initialize secret key once
         this.key = Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8));
         
-        // Fix #27: Cache parser instance
-        this.cachedParser = Jwts.parser().verifyWith(key).build();
+        // Fix #27: Cache parser instance — SEC-4: validate issuer
+        this.cachedParser = Jwts.parser().verifyWith(key).requireIssuer(ISSUER).build();
 
         // Start background cleanup thread
         cleanupExecutor.scheduleAtFixedRate(
@@ -162,6 +163,7 @@ public class JwtTokenProvider {
 
         String token = Jwts.builder()
                 .subject(subject)
+                .issuer(ISSUER)
                 .claim("type", type)
                 .issuedAt(now)
                 .expiration(expiryDate)

@@ -14,6 +14,8 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -26,7 +28,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/admin")
@@ -96,23 +97,25 @@ public class AdminController {
         return ResponseEntity.ok(response);
     }
 
-    // ── List all users ────────────────────────────────────
+    // ── List all users (BUG-5 fix: paginated) ───────────
     @GetMapping("/users")
     @PreAuthorize("hasRole('ADMIN')")
-    @Operation(summary = "List all users (admin only)")
-    public ResponseEntity<List<Map<String, Object>>> listUsers(
-            @RequestParam(required = false) User.UserType userType) {
+    @Operation(summary = "List all users — paginated (admin only)")
+    public ResponseEntity<Page<Map<String, Object>>> listUsers(
+            @RequestParam(required = false) User.UserType userType,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
 
-        List<User> users;
+        PageRequest pageRequest = PageRequest.of(page, size, Sort.by("createdAt").descending());
+
+        Page<User> usersPage;
         if (userType != null) {
-            users = userRepository.findAll().stream()
-                    .filter(u -> u.getUserType() == userType)
-                    .collect(Collectors.toList());
+            usersPage = userRepository.findByUserType(userType, pageRequest);
         } else {
-            users = userRepository.findAll();
+            usersPage = userRepository.findAll(pageRequest);
         }
 
-        List<Map<String, Object>> result = users.stream().map(u -> {
+        Page<Map<String, Object>> result = usersPage.map(u -> {
             Map<String, Object> map = new HashMap<>();
             map.put("id", u.getId());
             map.put("email", u.getEmail());
@@ -126,7 +129,7 @@ public class AdminController {
             map.put("agencyName", u.getAgency() != null ? u.getAgency().getBranchName() : null);
             map.put("createdAt", u.getCreatedAt());
             return map;
-        }).collect(Collectors.toList());
+        });
 
         return ResponseEntity.ok(result);
     }
@@ -237,22 +240,18 @@ public class AdminController {
             stats.put("agencyGovernorate", agent.getAgency().getGovernorate());
 
             UUID agencyId = agent.getAgency().getId();
-            // Clients in this agency
-            long agencyClients = userRepository.findAll().stream()
-                    .filter(u -> u.getAgency() != null && u.getAgency().getId().equals(agencyId))
-                    .filter(u -> u.getUserType() == User.UserType.PARTICULIER
-                            || u.getUserType() == User.UserType.COMMERCANT)
-                    .count();
+            // BUG-6 fix: Use count queries instead of loading all users
+            long agencyClients = userRepository.countByAgencyIdAndUserTypeIn(agencyId,
+                    List.of(User.UserType.PARTICULIER, User.UserType.COMMERCANT));
             stats.put("agencyClients", agencyClients);
 
-            // Pending accounts in this agency
-            long pendingAccounts = accountRepository.findByUserAgencyIdAndStatus(
-                    agencyId, com.amenbank.banking_webapp.model.Account.AccountStatus.PENDING_APPROVAL).size();
+            // BUG-6 fix: Use count queries instead of .size()
+            long pendingAccounts = accountRepository.countByUserAgencyIdAndStatus(
+                    agencyId, com.amenbank.banking_webapp.model.Account.AccountStatus.PENDING_APPROVAL);
             stats.put("pendingAccounts", pendingAccounts);
 
-            // Active accounts in this agency
-            long activeAccounts = accountRepository.findByUserAgencyIdAndStatusIn(
-                    agencyId, List.of(com.amenbank.banking_webapp.model.Account.AccountStatus.ACTIVE)).size();
+            long activeAccounts = accountRepository.countByUserAgencyIdAndStatusIn(
+                    agencyId, List.of(com.amenbank.banking_webapp.model.Account.AccountStatus.ACTIVE));
             stats.put("activeAccounts", activeAccounts);
         } else {
             // Admin with no agency — show global stats

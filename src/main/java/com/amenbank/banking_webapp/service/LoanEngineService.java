@@ -17,6 +17,7 @@ import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -412,6 +413,8 @@ public class LoanEngineService {
     /**
      * Process a payment against a loan contract.
      * Waterfall: penalty → interest → principal
+     * GAP-B FIX: Added balance check before payment
+     * GAP-J FIX: Overpayment carries across multiple installments
      */
     @Transactional
     public LoanPayment processPayment(UUID loanId, BigDecimal paymentAmount, LocalDate paymentDate) {
@@ -422,47 +425,74 @@ public class LoanEngineService {
             throw new BankingException("Ce prêt est déjà soldé");
         }
 
-        AmortizationSchedule nextDue = scheduleRepository.findNextDue(loanId)
-                .orElseThrow(() -> new BankingException("Aucune échéance en attente"));
+        // ── GAP-B: Balance check before payment ──────────────
+        Account account = loan.getAccount();
+        if (account.getBalance().compareTo(paymentAmount) < 0) {
+            throw new BankingException.InsufficientFundsException(
+                    String.format("Solde insuffisant. Nécessaire: %.3f TND, Disponible: %.3f TND",
+                            paymentAmount, account.getBalance()));
+        }
 
         BigDecimal remaining = paymentAmount;
+        BigDecimal totalPrincipalPaid = BigDecimal.ZERO;
+        BigDecimal totalInterestPaid = BigDecimal.ZERO;
+        BigDecimal totalPenaltyPaid = BigDecimal.ZERO;
+        int installmentsPaid = 0;
+        AmortizationSchedule lastProcessedLine = null;
 
-        // Step 1: Pay penalty first
-        BigDecimal penaltyPaid = BigDecimal.ZERO;
-        if (nextDue.getPenaltyAmount() != null && nextDue.getPenaltyAmount().compareTo(BigDecimal.ZERO) > 0) {
-            penaltyPaid = remaining.min(nextDue.getPenaltyAmount());
-            remaining = remaining.subtract(penaltyPaid);
-            nextDue.setPenaltyAmount(nextDue.getPenaltyAmount().subtract(penaltyPaid));
+        // ── GAP-J: Loop across multiple installments if overpayment ──
+        while (remaining.compareTo(BigDecimal.ZERO) > 0) {
+            Optional<AmortizationSchedule> nextDueOpt = scheduleRepository.findNextDue(loanId);
+            if (nextDueOpt.isEmpty()) break;
+            AmortizationSchedule nextDue = nextDueOpt.get();
+            lastProcessedLine = nextDue;
+
+            // Step 1: Pay penalty first
+            BigDecimal penaltyPaid = BigDecimal.ZERO;
+            if (nextDue.getPenaltyAmount() != null && nextDue.getPenaltyAmount().compareTo(BigDecimal.ZERO) > 0) {
+                penaltyPaid = remaining.min(nextDue.getPenaltyAmount());
+                remaining = remaining.subtract(penaltyPaid);
+                nextDue.setPenaltyAmount(nextDue.getPenaltyAmount().subtract(penaltyPaid));
+            }
+
+            // Step 2: Pay interest
+            BigDecimal interestPaid = remaining.min(nextDue.getInterestAmount());
+            remaining = remaining.subtract(interestPaid);
+
+            // Step 3: Pay principal
+            BigDecimal principalPaid = remaining.min(nextDue.getPrincipalAmount());
+            remaining = remaining.subtract(principalPaid);
+
+            // Update schedule line
+            BigDecimal totalPaidOnLine = penaltyPaid.add(interestPaid).add(principalPaid);
+            nextDue.setPaidAmount((nextDue.getPaidAmount() != null ? nextDue.getPaidAmount() : BigDecimal.ZERO)
+                    .add(totalPaidOnLine));
+            nextDue.setPaidDate(paymentDate);
+
+            if (nextDue.getPaidAmount().compareTo(nextDue.getInstallmentAmount()) >= 0) {
+                nextDue.setStatus(AmortizationSchedule.ScheduleStatus.PAID);
+                installmentsPaid++;
+            } else {
+                nextDue.setStatus(AmortizationSchedule.ScheduleStatus.PARTIAL);
+            }
+            scheduleRepository.save(nextDue);
+
+            totalPrincipalPaid = totalPrincipalPaid.add(principalPaid);
+            totalInterestPaid = totalInterestPaid.add(interestPaid);
+            totalPenaltyPaid = totalPenaltyPaid.add(penaltyPaid);
+
+            // If this line is only partially paid, stop — don't move to next
+            if (nextDue.getStatus() == AmortizationSchedule.ScheduleStatus.PARTIAL) {
+                break;
+            }
         }
-
-        // Step 2: Pay interest
-        BigDecimal interestPaid = remaining.min(nextDue.getInterestAmount());
-        remaining = remaining.subtract(interestPaid);
-
-        // Step 3: Pay principal
-        BigDecimal principalPaid = remaining.min(nextDue.getPrincipalAmount());
-        remaining = remaining.subtract(principalPaid);
-
-        // Update schedule line
-        BigDecimal totalPaidOnLine = penaltyPaid.add(interestPaid).add(principalPaid);
-        nextDue.setPaidAmount((nextDue.getPaidAmount() != null ? nextDue.getPaidAmount() : BigDecimal.ZERO)
-                .add(totalPaidOnLine));
-        nextDue.setPaidDate(paymentDate);
-
-        if (nextDue.getPaidAmount().compareTo(nextDue.getInstallmentAmount()) >= 0) {
-            nextDue.setStatus(AmortizationSchedule.ScheduleStatus.PAID);
-        } else {
-            nextDue.setStatus(AmortizationSchedule.ScheduleStatus.PARTIAL);
-        }
-        scheduleRepository.save(nextDue);
 
         // Update loan contract
-        loan.setOutstandingPrincipal(loan.getOutstandingPrincipal().subtract(principalPaid));
-        loan.setTotalInterestPaid(loan.getTotalInterestPaid().add(interestPaid));
-        loan.setAccruedInterest(loan.getAccruedInterest().subtract(interestPaid)
+        loan.setOutstandingPrincipal(loan.getOutstandingPrincipal().subtract(totalPrincipalPaid));
+        loan.setTotalInterestPaid(loan.getTotalInterestPaid().add(totalInterestPaid));
+        loan.setAccruedInterest(loan.getAccruedInterest().subtract(totalInterestPaid)
                 .max(BigDecimal.ZERO));
-        loan.setPaidInstallments(loan.getPaidInstallments() + (
-                nextDue.getStatus() == AmortizationSchedule.ScheduleStatus.PAID ? 1 : 0));
+        loan.setPaidInstallments(loan.getPaidInstallments() + installmentsPaid);
 
         // Check if loan is fully paid
         if (loan.getOutstandingPrincipal().compareTo(BigDecimal.ZERO) <= 0) {
@@ -470,8 +500,10 @@ public class LoanEngineService {
             loan.setStatus(LoanContract.LoanStatus.PAID_OFF);
             loan.setDaysOverdue(0);
             log.info("Loan {} fully paid off", loan.getContractNumber());
+
+            // ── GAP-E: Sync CreditRequest status to COMPLETED ──
+            syncCreditStatusToCompleted(loan);
         } else if (loan.getDaysOverdue() > 0) {
-            // Recalculate overdue status
             List<AmortizationSchedule> stillOverdue = scheduleRepository.findOverdueByLoanId(loanId);
             if (stillOverdue.isEmpty()) {
                 loan.setStatus(LoanContract.LoanStatus.ACTIVE);
@@ -481,42 +513,193 @@ public class LoanEngineService {
         loanContractRepository.save(loan);
 
         // Debit client account
-        Account account = loan.getAccount();
-        account.setBalance(account.getBalance().subtract(paymentAmount));
+        BigDecimal actuallyPaid = totalPrincipalPaid.add(totalInterestPaid).add(totalPenaltyPaid);
+        account.setBalance(account.getBalance().subtract(actuallyPaid));
         accountRepository.save(account);
 
         // Create transaction record
         transactionRepository.save(Transaction.builder()
                 .account(account)
                 .type(Transaction.TransactionType.DEBIT)
-                .amount(paymentAmount)
+                .amount(actuallyPaid)
                 .balanceAfter(account.getBalance())
-                .description(String.format("Échéance prêt %s #%d",
-                        loan.getContractNumber(), nextDue.getInstallmentNumber()))
+                .description(String.format("Paiement prêt %s (%d échéance(s))",
+                        loan.getContractNumber(), Math.max(installmentsPaid, 1)))
                 .category("loan_payment")
                 .build());
 
         // Record payment
         LoanPayment payment = LoanPayment.builder()
                 .loanContract(loan)
-                .scheduleEntry(nextDue)
+                .scheduleEntry(lastProcessedLine)
                 .paymentDate(paymentDate)
-                .totalPaid(paymentAmount)
-                .principalPaid(principalPaid)
-                .interestPaid(interestPaid)
-                .penaltyPaid(penaltyPaid)
+                .totalPaid(actuallyPaid)
+                .principalPaid(totalPrincipalPaid)
+                .interestPaid(totalInterestPaid)
+                .penaltyPaid(totalPenaltyPaid)
                 .outstandingAfter(loan.getOutstandingPrincipal())
                 .paymentType(LoanPayment.PaymentType.SCHEDULED)
                 .build();
         paymentRepository.save(payment);
 
-        auditService.log(AuditLog.AuditAction.CREDIT_REVIEWED, loan.getUser().getEmail(),
+        auditService.log(AuditLog.AuditAction.LOAN_PAYMENT, loan.getUser().getEmail(),
                 "LoanPayment", payment.getId().toString(),
-                String.format("Payment %.3f TND on loan %s (P=%.3f I=%.3f Pen=%.3f) CRD=%.3f",
-                        paymentAmount, loan.getContractNumber(), principalPaid, interestPaid,
-                        penaltyPaid, loan.getOutstandingPrincipal()));
+                String.format("Payment %.3f TND on loan %s (P=%.3f I=%.3f Pen=%.3f) CRD=%.3f [%d installment(s)]",
+                        actuallyPaid, loan.getContractNumber(), totalPrincipalPaid, totalInterestPaid,
+                        totalPenaltyPaid, loan.getOutstandingPrincipal(), Math.max(installmentsPaid, 1)));
 
         return payment;
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // GAP-A: AUTOMATIC PAYMENT COLLECTION (Direct Debit)
+    // ════════════════════════════════════════════════════════════
+
+    /**
+     * Scheduled job: auto-collect due payments every day at 6:00 AM.
+     * For each installment due today or overdue, attempts to debit the linked account.
+     * If insufficient funds, marks as OVERDUE and sends notification.
+     */
+    @Scheduled(cron = "0 0 6 * * *")
+    @Transactional
+    public void collectDuePayments() {
+        LocalDate today = LocalDate.now();
+        log.info("Auto-collection: checking for due payments on {}", today);
+
+        List<AmortizationSchedule> dueLines = scheduleRepository.findDueOnOrBefore(today);
+        int collected = 0;
+        int failed = 0;
+
+        for (AmortizationSchedule line : dueLines) {
+            LoanContract loan = line.getLoanContract();
+            if (loan.getStatus() == LoanContract.LoanStatus.PAID_OFF ||
+                loan.getStatus() == LoanContract.LoanStatus.CANCELLED) {
+                continue;
+            }
+
+            Account account = loan.getAccount();
+            BigDecimal amountDue = line.getInstallmentAmount();
+
+            // Add any penalty
+            if (line.getPenaltyAmount() != null && line.getPenaltyAmount().compareTo(BigDecimal.ZERO) > 0) {
+                amountDue = amountDue.add(line.getPenaltyAmount());
+            }
+
+            if (account.getBalance().compareTo(amountDue) >= 0) {
+                // Sufficient funds: auto-debit
+                try {
+                    processPayment(loan.getId(), amountDue, today);
+                    collected++;
+                    log.info("Auto-collected {} TND for loan {} installment #{}",
+                            amountDue, loan.getContractNumber(), line.getInstallmentNumber());
+                } catch (Exception e) {
+                    log.error("Auto-collection failed for loan {}: {}",
+                            loan.getContractNumber(), e.getMessage());
+                    failed++;
+                }
+            } else {
+                // Insufficient funds: mark as OVERDUE
+                line.setStatus(AmortizationSchedule.ScheduleStatus.OVERDUE);
+                scheduleRepository.save(line);
+
+                long daysLate = java.time.temporal.ChronoUnit.DAYS.between(line.getDueDate(), today);
+                loan.setDaysOverdue((int) daysLate);
+                loan.setStatus(daysLate > 90 ? LoanContract.LoanStatus.DEFAULTED : LoanContract.LoanStatus.OVERDUE);
+                loanContractRepository.save(loan);
+
+                // Notify client
+                notificationRepository.save(Notification.builder()
+                        .user(loan.getUser())
+                        .type(Notification.NotificationType.CREDIT)
+                        .title("⚠️ Échéance impayée — Solde insuffisant")
+                        .body(String.format(
+                                "L'échéance #%d de votre prêt %s (%.3f TND) n'a pas pu être prélevée. " +
+                                "Solde disponible: %.3f TND. Veuillez approvisionner votre compte.",
+                                line.getInstallmentNumber(), loan.getContractNumber(),
+                                amountDue, account.getBalance()))
+                        .build());
+
+                // Sync credit status to REPAYING/OVERDUE
+                syncCreditStatusToRepaying(loan);
+
+                failed++;
+            }
+        }
+
+        log.info("Auto-collection completed: {} collected, {} failed/overdue", collected, failed);
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // GAP-I: PAYMENT REMINDER NOTIFICATIONS (3 days before)
+    // ════════════════════════════════════════════════════════════
+
+    /**
+     * Scheduled job: send payment reminders 3 days before due date.
+     * Runs daily at 9:00 AM.
+     */
+    @Scheduled(cron = "0 0 9 * * *")
+    @Transactional
+    public void sendPaymentReminders() {
+        LocalDate reminderDate = LocalDate.now().plusDays(3);
+        log.info("Sending payment reminders for installments due on {}", reminderDate);
+
+        List<AmortizationSchedule> upcomingDue = scheduleRepository.findDueOnDate(reminderDate);
+
+        for (AmortizationSchedule line : upcomingDue) {
+            LoanContract loan = line.getLoanContract();
+            if (loan.getStatus() == LoanContract.LoanStatus.PAID_OFF ||
+                loan.getStatus() == LoanContract.LoanStatus.CANCELLED) {
+                continue;
+            }
+
+            Account account = loan.getAccount();
+            BigDecimal amountDue = line.getInstallmentAmount();
+            boolean sufficientFunds = account.getBalance().compareTo(amountDue) >= 0;
+
+            String body = String.format(
+                    "Rappel: l'échéance #%d de votre prêt %s (%.3f TND) est prévue le %s. %s",
+                    line.getInstallmentNumber(), loan.getContractNumber(),
+                    amountDue, reminderDate,
+                    sufficientFunds
+                            ? "Votre solde est suffisant pour le prélèvement automatique."
+                            : String.format("⚠️ Solde insuffisant (%.3f TND). Veuillez approvisionner votre compte.", account.getBalance()));
+
+            notificationRepository.save(Notification.builder()
+                    .user(loan.getUser())
+                    .type(Notification.NotificationType.CREDIT)
+                    .title("📅 Rappel d'échéance — " + loan.getContractNumber())
+                    .body(body)
+                    .build());
+        }
+
+        log.info("Payment reminders sent: {} notifications", upcomingDue.size());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // GAP-E: SYNC CREDIT STATUS WITH LOAN STATUS
+    // ════════════════════════════════════════════════════════════
+
+    /**
+     * When a loan starts being repaid, update the linked CreditRequest to REPAYING.
+     */
+    private void syncCreditStatusToRepaying(LoanContract loan) {
+        if (loan.getCreditRequest() != null) {
+            CreditRequest cr = loan.getCreditRequest();
+            if (cr.getStatus() == CreditRequest.CreditStatus.DISBURSED) {
+                cr.setStatus(CreditRequest.CreditStatus.REPAYING);
+                // Repository save is handled by cascade or in the calling @Transactional
+            }
+        }
+    }
+
+    /**
+     * When a loan is fully paid off, update the linked CreditRequest to COMPLETED.
+     */
+    private void syncCreditStatusToCompleted(LoanContract loan) {
+        if (loan.getCreditRequest() != null) {
+            CreditRequest cr = loan.getCreditRequest();
+            cr.setStatus(CreditRequest.CreditStatus.COMPLETED);
+        }
     }
 
     // ════════════════════════════════════════════════════════════
@@ -950,6 +1133,13 @@ public class LoanEngineService {
     @Transactional(readOnly = true)
     public List<InterestAccrual> getAccruals(UUID loanId) {
         return accrualRepository.findByLoanContractIdOrderByAccrualDateDesc(loanId);
+    }
+
+    /** GAP-H: Get a single payment by ID (for receipt generation) */
+    @Transactional(readOnly = true)
+    public LoanPayment getPaymentById(UUID paymentId) {
+        return paymentRepository.findById(paymentId)
+                .orElseThrow(() -> new NotFoundException("Paiement introuvable"));
     }
 }
 

@@ -36,19 +36,43 @@ public class CreditService {
         private final AccountRepository accountRepository;
         private final TransactionRepository transactionRepository;
         private final LoanProductRepository loanProductRepository;
+        private final LoanContractRepository loanContractRepository;
+        private final ReferenceRateRepository referenceRateRepository;
         private final AuditService auditService;
         private final LoanEngineService loanEngineService;
 
-        // ── Interest rates by credit type (annual %) ───────────
-        private static final Map<CreditRequest.CreditType, BigDecimal> INTEREST_RATES = Map.of(
+        // ── Fallback interest rates by credit type (annual %) ──
+        // Used only when no active LoanProduct exists for the credit type
+        private static final Map<CreditRequest.CreditType, BigDecimal> FALLBACK_INTEREST_RATES = Map.of(
                         CreditRequest.CreditType.PERSONNEL, new BigDecimal("8.50"),
                         CreditRequest.CreditType.IMMOBILIER, new BigDecimal("5.75"),
                         CreditRequest.CreditType.COMMERCIAL, new BigDecimal("7.00"),
                         CreditRequest.CreditType.EQUIPEMENT, new BigDecimal("6.50"));
 
+        // ── GAP-G: Resolve rate from LoanProduct (real rate) or fallback ──
+        private BigDecimal resolveRate(CreditRequest.CreditType creditType) {
+                return loanProductRepository.findByCreditTypeAndIsActiveTrue(creditType)
+                                .stream()
+                                .findFirst()
+                                .map(product -> {
+                                        if (product.getRateType() == LoanProduct.RateType.VARIABLE
+                                                        && product.getReferenceIndex() != null) {
+                                                return referenceRateRepository
+                                                                .findCurrentRate(product.getReferenceIndex(), LocalDate.now())
+                                                                .map(ref -> ref.getRateValue().add(product.getMargin()))
+                                                                .orElse(FALLBACK_INTEREST_RATES.get(creditType));
+                                        } else if (product.getFixedRate() != null) {
+                                                return product.getFixedRate();
+                                        }
+                                        return FALLBACK_INTEREST_RATES.get(creditType);
+                                })
+                                .orElse(FALLBACK_INTEREST_RATES.get(creditType));
+        }
+
         // ── Simulate (no persistence) ──────────────────────────
         public CreditResponse simulate(CreditSimulationRequest request) {
-                BigDecimal rate = INTEREST_RATES.get(request.getCreditType());
+                // GAP-G: Use LoanProduct rate (same rate the actual loan will use)
+                BigDecimal rate = resolveRate(request.getCreditType());
                 BigDecimal monthlyPayment = calculateMonthlyPayment(
                                 request.getAmountRequested(), rate, request.getDurationMonths());
 
@@ -74,7 +98,8 @@ public class CreditService {
                 User user = userRepository.findByEmail(userEmail)
                                 .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
 
-                BigDecimal rate = INTEREST_RATES.get(request.getCreditType());
+                // GAP-G: Use LoanProduct rate (consistent with what the actual loan will use)
+                BigDecimal rate = resolveRate(request.getCreditType());
                 BigDecimal monthlyPayment = calculateMonthlyPayment(
                                 request.getAmountRequested(), rate, request.getDurationMonths());
 
@@ -176,6 +201,7 @@ public class CreditService {
         }
 
         // ── Single credit detail ───────────────────────────────
+        @Transactional(readOnly = true)
         public CreditResponse getCreditById(String userEmail, UUID creditId) {
                 User user = userRepository.findByEmail(userEmail)
                                 .orElseThrow(() -> new NotFoundException(USER_NOT_FOUND));
@@ -192,7 +218,7 @@ public class CreditService {
 
         // ── Review credit (AGENT / ADMIN) ─────────────────────
         @Transactional
-        public CreditResponse reviewCredit(UUID creditId, CreditReviewRequest request) {
+        public CreditResponse reviewCredit(UUID creditId, CreditReviewRequest request, String agentEmail) {
                 CreditRequest credit = creditRequestRepository.findById(creditId)
                                 .orElseThrow(() -> new NotFoundException(CREDIT_NOT_FOUND));
 
@@ -237,7 +263,7 @@ public class CreditService {
                                 .body(notifBody)
                                 .build());
 
-                auditService.log(AuditLog.AuditAction.CREDIT_REVIEWED, "agent",
+                auditService.log(AuditLog.AuditAction.CREDIT_REVIEWED, agentEmail,
                         "CreditRequest", credit.getId().toString(),
                         "Decision: " + request.getDecision());
 
@@ -246,7 +272,7 @@ public class CreditService {
 
         // ── Disburse credit (ADMIN only) ──────────────────────
         @Transactional
-        public CreditResponse disburseCredit(UUID creditId) {
+        public CreditResponse disburseCredit(UUID creditId, String adminEmail) {
                 CreditRequest credit = creditRequestRepository.findById(creditId)
                                 .orElseThrow(() -> new NotFoundException(CREDIT_NOT_FOUND));
 
@@ -307,6 +333,10 @@ public class CreditService {
 
                                 log.info("Loan contract {} created from credit request {}",
                                                 loan.getContractNumber(), credit.getId());
+
+                                // GAP-E: Update credit status to REPAYING (loan is now active)
+                                credit.setStatus(CreditRequest.CreditStatus.REPAYING);
+                                creditRequestRepository.save(credit);
                         } else {
                                 log.warn("No active loan product found for credit type {}, skipping loan creation",
                                                 credit.getCreditType());
@@ -328,7 +358,7 @@ public class CreditService {
                                                 targetAccount.getAccountNumber(), targetAccount.getBalance()))
                                 .build());
 
-                auditService.log(AuditLog.AuditAction.CREDIT_DISBURSED, "admin",
+                auditService.log(AuditLog.AuditAction.CREDIT_DISBURSED, adminEmail,
                         "CreditRequest", credit.getId().toString(),
                         "Disbursed " + credit.getAmountRequested() + " TND to " + targetAccount.getAccountNumber());
 
@@ -367,6 +397,20 @@ public class CreditService {
                 BigDecimal totalInterest = totalCost.subtract(c.getAmountRequested());
 
                 User requester = c.getUser();
+
+                // GAP-C: Lookup linked loan contract
+                UUID loanContractId = null;
+                String loanContractNumber = null;
+                if (c.getId() != null && (c.getStatus() == CreditRequest.CreditStatus.DISBURSED
+                                || c.getStatus() == CreditRequest.CreditStatus.REPAYING
+                                || c.getStatus() == CreditRequest.CreditStatus.COMPLETED)) {
+                        var loanOpt = loanContractRepository.findByCreditRequestId(c.getId());
+                        if (loanOpt.isPresent()) {
+                                loanContractId = loanOpt.get().getId();
+                                loanContractNumber = loanOpt.get().getContractNumber();
+                        }
+                }
+
                 return CreditResponse.builder()
                                 .id(c.getId())
                                 .creditType(c.getCreditType().name())
@@ -386,12 +430,14 @@ public class CreditService {
                                 .agencyName(requester != null && requester.getAgency() != null
                                                 ? requester.getAgency().getBranchName()
                                                 : null)
+                                .loanContractId(loanContractId)
+                                .loanContractNumber(loanContractNumber)
                                 .build();
         }
 
-        /** Sanitize input to prevent XSS */
+        /** Sanitize input to prevent XSS — SEC-6 fix */
         private String sanitize(String input) {
                 if (input == null) return null;
-                return input.replaceAll("[<>\"'&]", "");
+                return org.springframework.web.util.HtmlUtils.htmlEscape(input);
         }
 }

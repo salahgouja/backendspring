@@ -28,4 +28,8 @@ public class CreditResponse {
     private String userName;
     private String userEmail;
     private String agencyName;
+
+    // GAP-C: Link to loan contract after disbursement
+    private UUID loanContractId;
+    private String loanContractNumber;
 }

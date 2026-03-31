@@ -27,6 +27,7 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Service
 @RequiredArgsConstructor
@@ -35,6 +36,7 @@ public class TransferService {
 
     private static final String BEAN_NAME = "TransferService";
     private static final String USER_NOT_FOUND = "Utilisateur introuvable";
+    private static final AtomicLong REFERENCE_SEQ = new AtomicLong(System.currentTimeMillis() % 100_000);
 
     private final TransferRepository transferRepository;
     private final AccountRepository accountRepository;
@@ -44,7 +46,6 @@ public class TransferService {
     private final BatchTransferRepository batchTransferRepository;
     private final BatchTransferItemRepository batchTransferItemRepository;
     private final AuditService auditService;
-    private final FraudService fraudService;
     private final EmailService emailService;
 
     @Value("${app.transfer.max-amount-per-transaction:100000.000}")
@@ -68,7 +69,7 @@ public class TransferService {
     }
 
     // ============================================================
-    // GAP-11: Self-Transfer (between own accounts — no 2FA, no daily limit)
+    // Self-Transfer (between own accounts — no 2FA, no daily limit)
     // ============================================================
     @Transactional
     public TransferResponse createSelfTransfer(String userEmail, TransferRequest request) {
@@ -225,10 +226,7 @@ public class TransferService {
                 String.format("%.3f %s from %s to %s", amount, senderAccount.getCurrency(),
                         senderAccount.getAccountNumber(), receiverAccount.getAccountNumber()));
 
-        // 17. Fraud analysis (fix #10)
-        fraudService.analyzeTransfer(transfer, sender);
-
-        // 18. GAP-23: Email confirmation
+        // 17. GAP-23: Email confirmation
         emailService.sendTransferConfirmation(sender.getEmail(),
                 senderAccount.getAccountNumber(), receiverAccount.getAccountNumber(),
                 String.format("%.3f", amount), transfer.getReferenceNumber());
@@ -762,14 +760,13 @@ public class TransferService {
 
     private String sanitizeMotif(String motif) {
         if (motif == null) return null;
-        return motif.replaceAll("[<>\"'&]", "");
+        return org.springframework.web.util.HtmlUtils.htmlEscape(motif);
     }
 
-    /** GAP-12: Generate a human-readable reference number for transfer receipts */
+    /** GAP-12: Generate a human-readable, unique reference number (PERF-4 fix: AtomicLong) */
     private String generateReferenceNumber() {
         String date = LocalDate.now().toString().replace("-", "");
-        String seq = String.format("%05d",
-                Math.abs(UUID.randomUUID().getLeastSignificantBits() % 100_000));
+        String seq = String.format("%06d", REFERENCE_SEQ.incrementAndGet() % 1_000_000);
         return "VIR-" + date + "-" + seq;
     }
 

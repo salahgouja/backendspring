@@ -30,6 +30,10 @@ public interface AmortizationScheduleRepository extends JpaRepository<Amortizati
     @Query("SELECT a FROM AmortizationSchedule a WHERE a.dueDate <= :date AND a.status = 'PENDING'")
     List<AmortizationSchedule> findDueOnOrBefore(@Param("date") LocalDate date);
 
+    /** All installments due on a specific date (for reminders) — GAP-I */
+    @Query("SELECT a FROM AmortizationSchedule a WHERE a.dueDate = :date AND a.status = 'PENDING'")
+    List<AmortizationSchedule> findDueOnDate(@Param("date") LocalDate date);
+
     /** Remaining unpaid schedule lines for recalculation */
     @Query("SELECT a FROM AmortizationSchedule a WHERE a.loanContract.id = :loanId " +
            "AND a.status IN ('PENDING', 'DUE', 'GRACE') ORDER BY a.installmentNumber ASC")

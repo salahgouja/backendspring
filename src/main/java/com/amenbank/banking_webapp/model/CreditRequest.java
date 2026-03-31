@@ -73,7 +73,9 @@ public class CreditRequest {
         APPROVED,
         REJECTED,
         CANCELLED, // Cancelled by the client
-        DISBURSED // Money credited to client's account
+        DISBURSED, // Money credited to client's account
+        REPAYING,  // GAP-E: Loan is being actively repaid
+        COMPLETED  // GAP-E: Loan fully paid off
     }
 
     @Override

@@ -34,5 +34,10 @@ build/
 
 ### Environment ###
 .env
+!.env.example
+
+### Uploads ###
+uploads/
+
 ### folder for explanation ###
 explanation/

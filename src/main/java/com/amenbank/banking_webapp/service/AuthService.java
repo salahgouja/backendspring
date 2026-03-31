@@ -32,8 +32,10 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.util.HtmlUtils;
 
 import java.math.BigDecimal;
+import java.security.SecureRandom;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
@@ -48,9 +50,9 @@ public class AuthService {
     private static final String BEAN_NAME = "AuthService";
     private static final Pattern PASSWORD_PATTERN = Pattern.compile(
             "^(?=.*[0-9])(?=.*[a-z])(?=.*[A-Z])(?=.*[@#$%^&+=])(?=\\S+$).{8,}$");
-    private static final String ACCOUNT_PREFIX = "AMEN";
     private static final int MAX_FAILED_ATTEMPTS = 5;
     private static final int LOCK_DURATION_MINUTES = 30;
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
     private final UserRepository userRepository;
     private final AccountRepository accountRepository;
@@ -63,6 +65,7 @@ public class AuthService {
     private final UserDetailsServiceImpl userDetailsService;
     private final com.amenbank.banking_webapp.repository.PasswordResetTokenRepository passwordResetTokenRepository;
     private final EmailService emailService;
+    private final AccountNumberGenerator accountNumberGenerator;
 
     @Value("${app.security.min-password-length:8}")
     private int minPasswordLength;
@@ -397,8 +400,11 @@ public class AuthService {
                     String.format("Compte verrouillé suite à trop de tentatives. Réessayez dans %d minutes.", minutesLeft + 1));
         }
     }
-    //@Transactional (making error )
-    private void handleFailedLogin(String email) {
+    /**
+     * SEC-5 fix: Method is package-private to allow Spring AOP transactional proxying.
+     * Called within login's @Transactional context.
+     */
+    void handleFailedLogin(String email) {
         userRepository.findByEmail(email).ifPresent(user -> {
             int attempts = user.getFailedLoginAttempts() + 1;
             user.setFailedLoginAttempts(attempts);
@@ -489,7 +495,7 @@ public class AuthService {
     private Account createDefaultAccount(User user) {
         Account defaultAccount = Account.builder()
                 .user(user)
-                .accountNumber(generateAccountNumber())
+                .accountNumber(accountNumberGenerator.generate())
                 .accountType(user.getUserType() == User.UserType.COMMERCANT
                         ? Account.AccountType.COMMERCIAL
                         : Account.AccountType.COURANT)
@@ -516,24 +522,10 @@ public class AuthService {
         }
     }
 
-    private synchronized String generateAccountNumber() {
-        String accountNumber;
-        int attempts = 0;
-        do {
-            accountNumber = ACCOUNT_PREFIX + String.format("%012d",
-                    Math.abs(UUID.randomUUID().getLeastSignificantBits() % 1_000_000_000_000L));
-            attempts++;
-        } while (accountRepository.findByAccountNumber(accountNumber).isPresent() && attempts < 10);
-        if (attempts >= 10) {
-            throw new BankingException("Erreur lors de la génération du numéro de compte");
-        }
-        return accountNumber;
-    }
-
-    /** Sanitize input to prevent XSS (fix #32) */
+    /** Sanitize input to prevent XSS — uses HTML encoding instead of stripping (SEC-6 fix) */
     private String sanitize(String input) {
         if (input == null) return null;
-        return input.replaceAll("[<>\"'&]", "");
+        return HtmlUtils.htmlEscape(input);
     }
 
     private AuthResponse buildAuthResponse(User user, String accessToken, String refreshToken) {
@@ -587,8 +579,8 @@ public class AuthService {
                     "Si cette adresse email est enregistrée, un code de réinitialisation a été envoyé.");
         }
 
-        // Generate 6-digit OTP
-        String otpCode = String.format("%06d", new java.util.Random().nextInt(999999));
+        // Generate 6-digit OTP using SecureRandom (SEC-2 fix)
+        String otpCode = String.format("%06d", SECURE_RANDOM.nextInt(999999));
 
         // Expire old tokens
         passwordResetTokenRepository.findActiveTokenByEmail(email, LocalDateTime.now())
@@ -618,14 +610,15 @@ public class AuthService {
         // GAP-23: Send OTP via email
         emailService.sendPasswordResetOtp(user.getEmail(), otpCode);
 
-        auditService.log(AuditLog.AuditAction.PASSWORD_CHANGED, email,
+        // BUG-4 fix: Use PASSWORD_RESET_REQUESTED instead of PASSWORD_CHANGED
+        auditService.log(AuditLog.AuditAction.PASSWORD_RESET_REQUESTED, email,
                 "User", user.getId().toString(), "Password reset OTP requested");
 
         log.info("{}: Password reset OTP generated for user: {}", BEAN_NAME, email);
 
+        // SEC-1 fix: Never return OTP in response — it's sent via email/notification only
         return Map.of(
-                "message", "Si cette adresse email est enregistrée, un code de réinitialisation a été envoyé.",
-                "otpCode", otpCode // REMOVE IN PRODUCTION — only for dev/testing via Swagger
+                "message", "Si cette adresse email est enregistrée, un code de réinitialisation a été envoyé."
         );
     }
 

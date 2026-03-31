@@ -1,13 +1,17 @@
 package com.amenbank.banking_webapp.controller;
 
+import com.amenbank.banking_webapp.dto.request.LoanApplicationRequest;
 import com.amenbank.banking_webapp.dto.request.LoanSimulationRequest;
 import com.amenbank.banking_webapp.dto.response.AmortizationLineResponse;
+import com.amenbank.banking_webapp.dto.response.CreditResponse;
 import com.amenbank.banking_webapp.dto.response.LoanContractResponse;
 import com.amenbank.banking_webapp.dto.response.LoanProductResponse;
+import com.amenbank.banking_webapp.dto.request.CreditSimulationRequest;
 import com.amenbank.banking_webapp.exception.BankingException;
 import com.amenbank.banking_webapp.exception.BankingException.NotFoundException;
 import com.amenbank.banking_webapp.model.*;
 import com.amenbank.banking_webapp.repository.*;
+import com.amenbank.banking_webapp.service.CreditService;
 import com.amenbank.banking_webapp.service.LoanEngineService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.security.SecurityRequirement;
@@ -32,6 +36,7 @@ import java.util.*;
 public class LoanController {
 
     private final LoanEngineService loanEngineService;
+    private final CreditService creditService;
     private final LoanProductRepository loanProductRepository;
     private final LoanContractRepository loanContractRepository;
     private final ReferenceRateRepository referenceRateRepository;
@@ -279,6 +284,49 @@ public class LoanController {
     }
 
     // ════════════════════════════════════════════════════════════
+    // GAP-F: LOAN APPLICATION (Bridge Simulation → Credit Request)
+    // ════════════════════════════════════════════════════════════
+
+    @PostMapping("/apply")
+    @Operation(summary = "Apply for a loan from simulation — creates a credit request",
+            description = "Bridges the loan simulation to the credit application flow. " +
+                          "Uses the LoanProduct's real rate (not hardcoded) to create a CreditRequest " +
+                          "that will go through the standard approval workflow.")
+    public ResponseEntity<CreditResponse> applyForLoan(
+            Authentication auth,
+            @Valid @RequestBody LoanApplicationRequest request) {
+
+        // Validate the product exists and is active
+        LoanProduct product = loanProductRepository.findByCode(request.getProductCode())
+                .orElseThrow(() -> new NotFoundException("Produit introuvable: " + request.getProductCode()));
+
+        if (!Boolean.TRUE.equals(product.getIsActive())) {
+            throw new BankingException("Ce produit de prêt n'est plus actif");
+        }
+
+        // Validate against product limits
+        if (product.getMinAmount() != null && request.getAmount().compareTo(product.getMinAmount()) < 0)
+            throw new BankingException("Montant minimum: " + product.getMinAmount() + " TND");
+        if (product.getMaxAmount() != null && request.getAmount().compareTo(product.getMaxAmount()) > 0)
+            throw new BankingException("Montant maximum: " + product.getMaxAmount() + " TND");
+        if (product.getMinDurationMonths() != null && request.getDurationMonths() < product.getMinDurationMonths())
+            throw new BankingException("Durée minimum: " + product.getMinDurationMonths() + " mois");
+        if (product.getMaxDurationMonths() != null && request.getDurationMonths() > product.getMaxDurationMonths())
+            throw new BankingException("Durée maximum: " + product.getMaxDurationMonths() + " mois");
+
+        // Convert to CreditSimulationRequest and submit through CreditService
+        CreditSimulationRequest creditRequest = new CreditSimulationRequest();
+        creditRequest.setCreditType(product.getCreditType());
+        creditRequest.setAmountRequested(request.getAmount());
+        creditRequest.setDurationMonths(request.getDurationMonths());
+        creditRequest.setPurpose(request.getPurpose() != null ? request.getPurpose()
+                : "Demande via simulation produit " + product.getName());
+
+        CreditResponse response = creditService.submit(auth.getName(), creditRequest);
+        return ResponseEntity.ok(response);
+    }
+
+    // ════════════════════════════════════════════════════════════
     // LOAN CONTRACTS
     // ════════════════════════════════════════════════════════════
 
@@ -370,6 +418,72 @@ public class LoanController {
                 "penaltyPaid", payment.getPenaltyPaid(),
                 "loanStatus", "PAID_OFF"
         ));
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // GAP-H: PAYMENT RECEIPT
+    // ════════════════════════════════════════════════════════════
+
+    @GetMapping("/payments/{paymentId}/receipt")
+    @Operation(summary = "Get payment receipt (proof of payment)",
+            description = "Returns a detailed receipt for a specific loan payment. " +
+                          "Includes borrower info, contract details, payment breakdown, and outstanding balance.")
+    public ResponseEntity<Map<String, Object>> getPaymentReceipt(
+            Authentication auth,
+            @PathVariable UUID paymentId) {
+
+        LoanPayment payment = loanEngineService.getPaymentById(paymentId);
+        LoanContract loan = payment.getLoanContract();
+
+        // Verify the user owns this loan
+        User user = userRepository.findByEmail(auth.getName())
+                .orElseThrow(() -> new NotFoundException("Utilisateur introuvable"));
+        if (!loan.getUser().getId().equals(user.getId())
+                && user.getUserType() != User.UserType.ADMIN
+                && user.getUserType() != User.UserType.AGENT) {
+            throw new BankingException.ForbiddenException("Ce paiement ne vous appartient pas");
+        }
+
+        Map<String, Object> receipt = new LinkedHashMap<>();
+        receipt.put("receiptNumber", "REC-" + payment.getId().toString().substring(0, 8).toUpperCase());
+        receipt.put("paymentDate", payment.getPaymentDate());
+        receipt.put("issuedAt", payment.getCreatedAt());
+
+        // Borrower info
+        Map<String, Object> borrower = new LinkedHashMap<>();
+        borrower.put("name", loan.getUser().getFullNameFr());
+        borrower.put("email", loan.getUser().getEmail());
+        receipt.put("borrower", borrower);
+
+        // Contract info
+        Map<String, Object> contract = new LinkedHashMap<>();
+        contract.put("contractNumber", loan.getContractNumber());
+        contract.put("productName", loan.getProduct().getName());
+        contract.put("principalAmount", loan.getPrincipalAmount());
+        contract.put("currentRate", loan.getCurrentRate());
+        contract.put("currency", loan.getCurrency());
+        receipt.put("contract", contract);
+
+        // Payment breakdown
+        Map<String, Object> breakdown = new LinkedHashMap<>();
+        breakdown.put("totalPaid", payment.getTotalPaid());
+        breakdown.put("principalPaid", payment.getPrincipalPaid());
+        breakdown.put("interestPaid", payment.getInterestPaid());
+        breakdown.put("penaltyPaid", payment.getPenaltyPaid());
+        breakdown.put("paymentType", payment.getPaymentType().name());
+        receipt.put("paymentBreakdown", breakdown);
+
+        // After payment
+        Map<String, Object> afterPayment = new LinkedHashMap<>();
+        afterPayment.put("outstandingPrincipal", payment.getOutstandingAfter());
+        afterPayment.put("remainingInstallments", loan.getTotalInstallments() - loan.getPaidInstallments());
+        afterPayment.put("loanStatus", loan.getStatus().name());
+        receipt.put("afterPayment", afterPayment);
+
+        receipt.put("bankName", "Amen Bank");
+        receipt.put("disclaimer", "Ce reçu est généré automatiquement par le système bancaire Amen Bank.");
+
+        return ResponseEntity.ok(receipt);
     }
 
     // ════════════════════════════════════════════════════════════

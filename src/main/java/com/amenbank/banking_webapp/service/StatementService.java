@@ -85,7 +85,7 @@ public class StatementService {
     }
 
     private byte[] buildPdf(Account account, User user, LocalDate from, LocalDate to,
-                            List<Transaction> transactions) throws DocumentException {
+            List<Transaction> transactions) throws DocumentException {
 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         Document document = new Document(PageSize.A4, 36, 36, 50, 40);
@@ -98,7 +98,6 @@ public class StatementService {
         document.add(bankName);
 
         Paragraph bankInfo = new Paragraph(
-                "Banque Universelle — Société Anonyme au capital de 132.405.000 TND\n" +
                 "Siège Social: Avenue Mohamed V — 1002 Tunis — RC B1111201997",
                 FOOTER_FONT);
         bankInfo.setAlignment(Element.ALIGN_CENTER);
@@ -128,7 +127,7 @@ public class StatementService {
         // ── Account Info Table ───────────────────────────
         PdfPTable infoTable = new PdfPTable(4);
         infoTable.setWidthPercentage(100);
-        infoTable.setWidths(new float[]{1.2f, 2f, 1.2f, 2f});
+        infoTable.setWidths(new float[] { 1.2f, 2f, 1.2f, 2f });
 
         addInfoCell(infoTable, "Titulaire:", user.getFullNameFr());
         addInfoCell(infoTable, "CIN:", user.getCin());
@@ -145,7 +144,7 @@ public class StatementService {
         // ── Transactions Table ───────────────────────────
         PdfPTable txTable = new PdfPTable(6);
         txTable.setWidthPercentage(100);
-        txTable.setWidths(new float[]{1.5f, 0.8f, 1.2f, 1.2f, 1.2f, 2.5f});
+        txTable.setWidths(new float[] { 1.5f, 0.8f, 1.2f, 1.2f, 1.2f, 2.5f });
 
         // Header row
         addHeaderCell(txTable, "Date");
@@ -197,14 +196,15 @@ public class StatementService {
         footer.setSpacingBefore(30);
         footer.add(new Chunk(
                 "Document généré automatiquement le " + LocalDateTime.now().format(DATETIME_FMT) +
-                " — Ce relevé est fourni à titre informatif et ne constitue pas un document contractuel.\n" +
-                "Amen Bank — Tél: 71 148 000 — www.amenbank.com.tn",
+                        " — Ce relevé est fourni à titre informatif et ne constitue pas un document contractuel.\n" +
+                        "Amen Bank — Tél: 71 148 000 — www.amenbank.com.tn",
                 FOOTER_FONT));
         footer.setAlignment(Element.ALIGN_CENTER);
         document.add(footer);
 
         document.close();
-        log.info("PDF statement generated for account {} ({} transactions)", account.getAccountNumber(), transactions.size());
+        log.info("PDF statement generated for account {} ({} transactions)", account.getAccountNumber(),
+                transactions.size());
         return baos.toByteArray();
     }
 
@@ -237,4 +237,3 @@ public class StatementService {
         table.addCell(cell);
     }
 }
-

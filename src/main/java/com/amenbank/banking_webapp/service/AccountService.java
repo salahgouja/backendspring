@@ -32,6 +32,7 @@ public class AccountService {
     private final UserRepository userRepository;
     private final NotificationRepository notificationRepository;
     private final AuditService auditService;
+    private final AccountNumberGenerator accountNumberGenerator;
 
     @Transactional(readOnly = true)
     public List<AccountResponse> getUserAccounts(String email) {
@@ -116,7 +117,7 @@ public class AccountService {
 
         Account account = Account.builder()
                 .user(user)
-                .accountNumber(generateAccountNumber())
+                .accountNumber(accountNumberGenerator.generate())
                 .accountType(request.getAccountType())
                 .balance(BigDecimal.ZERO)
                 .isActive(false)
@@ -320,17 +321,6 @@ public class AccountService {
         }
     }
 
-    private String generateAccountNumber() {
-        String accountNumber;
-        int attempts = 0;
-        do {
-            accountNumber = "AMEN" + String.format("%012d",
-                    Math.abs(UUID.randomUUID().getLeastSignificantBits() % 1_000_000_000_000L));
-            attempts++;
-        } while (accountRepository.findByAccountNumber(accountNumber).isPresent() && attempts < 10);
-        if (attempts >= 10) throw new BankingException("Erreur lors de la génération du numéro de compte");
-        return accountNumber;
-    }
 
     private TransactionResponse toTransactionResponse(Transaction tx) {
         return TransactionResponse.builder()

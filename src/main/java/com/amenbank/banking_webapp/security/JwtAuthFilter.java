@@ -133,13 +133,16 @@ public class JwtAuthFilter extends OncePerRequestFilter {
     // ============================================================
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
-        String path = request.getRequestURI();
-        
+        // Use getServletPath() which excludes the context-path (/api) — SEC-10 fix
+        String path = request.getServletPath();
+
         // Skip public endpoints
         return path.equals("/auth/register") ||
                path.equals("/auth/login") ||
                path.equals("/auth/refresh") ||
                path.equals("/auth/2fa/verify") ||
+               path.equals("/auth/forgot-password") ||
+               path.equals("/auth/reset-password") ||
                path.startsWith("/agencies/") ||
                path.startsWith("/swagger-ui/") ||
                path.startsWith("/api-docs/") ||

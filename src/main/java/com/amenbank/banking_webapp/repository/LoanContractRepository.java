@@ -30,5 +30,8 @@ public interface LoanContractRepository extends JpaRepository<LoanContract, UUID
     List<LoanContract> findAllActiveLoans();
 
     boolean existsByContractNumber(String contractNumber);
+
+    /** GAP-C: Find loan contract linked to a credit request */
+    Optional<LoanContract> findByCreditRequestId(UUID creditRequestId);
 }
 

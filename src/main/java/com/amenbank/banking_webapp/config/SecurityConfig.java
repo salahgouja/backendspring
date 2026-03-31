@@ -101,7 +101,6 @@ public class SecurityConfig {
 
                                                 // ── Agent + Admin endpoints ───────────────────
                                                 .requestMatchers("/agent/**").hasAnyRole("AGENT", "ADMIN")
-                                                .requestMatchers("/fraud-alerts/**").hasAnyRole("AGENT", "ADMIN")
 
                                                 // ── All other endpoints require authentication ─
                                                 .anyRequest().authenticated())
@@ -139,6 +138,12 @@ public class SecurityConfig {
 
                                 // Add JWT filter before username/password filter
                                 .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)
+
+                                // SEC-11: HSTS headers for HTTPS enforcement
+                                .headers(headers -> headers
+                                                .httpStrictTransportSecurity(hsts -> hsts
+                                                                .includeSubDomains(true)
+                                                                .maxAgeInSeconds(31536000)))
 
                                 // Configure authentication provider
                                 .authenticationProvider(authenticationProvider());

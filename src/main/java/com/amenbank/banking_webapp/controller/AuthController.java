@@ -133,7 +133,7 @@ public class AuthController {
     @Operation(summary = "Reset password using OTP code",
             description = "Verifies the OTP and sets a new password. The OTP is single-use and expires in 15 minutes.")
     public ResponseEntity<Map<String, String>> resetPassword(
-            @Valid @RequestBody ResetPasswordRequest request) {
+            @RequestBody ResetPasswordRequest request) {
         return ResponseEntity.ok(authService.resetPassword(
                 request.getEmail(), request.getOtpCode(), request.getNewPassword()));
     }

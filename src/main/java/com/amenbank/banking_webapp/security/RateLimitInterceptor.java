@@ -6,6 +6,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.web.servlet.HandlerInterceptor;
 
@@ -15,6 +16,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * GAP-19: API Rate Limiting interceptor using Bucket4j (token bucket algorithm).
+ * SEC-9 fix: Buckets are now evicted after 5 minutes of inactivity to prevent OOM.
  * Limits:
  *   - General API: 60 requests/minute per IP
  *   - Auth endpoints: 10 requests/minute per IP (brute-force protection)
@@ -24,13 +26,23 @@ import java.util.concurrent.ConcurrentHashMap;
 @Slf4j
 public class RateLimitInterceptor implements HandlerInterceptor {
 
-    // In-memory buckets keyed by IP + category
-    private final Map<String, Bucket> buckets = new ConcurrentHashMap<>();
+    private static final int MAX_BUCKETS = 10_000;
+    private static final long EVICTION_TTL_MILLIS = 5 * 60 * 1000; // 5 minutes
+
+    // Bucket + last access time for eviction
+    private record BucketEntry(Bucket bucket, long lastAccessMillis) {}
+
+    private final Map<String, BucketEntry> buckets = new ConcurrentHashMap<>();
 
     @Override
     public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) throws Exception {
         String clientIp = getClientIp(request);
         String path = request.getRequestURI();
+
+        // SEC-9: Hard limit on bucket count to prevent OOM under DDoS
+        if (buckets.size() >= MAX_BUCKETS) {
+            evictStaleBuckets();
+        }
 
         // Determine rate limit tier
         String bucketKey;
@@ -38,21 +50,17 @@ public class RateLimitInterceptor implements HandlerInterceptor {
 
         if (path.contains("/auth/login") || path.contains("/auth/register")
                 || path.contains("/auth/forgot-password") || path.contains("/auth/reset-password")) {
-            // Auth endpoints: strict — 10 req/min
             bucketKey = clientIp + ":auth";
-            bucket = buckets.computeIfAbsent(bucketKey, k -> createBucket(10, 1));
+            bucket = getOrCreateBucket(bucketKey, 10, 1);
         } else if (path.contains("/transfers") || path.contains("/credits/submit")) {
-            // Financial ops: 20 req/min
             bucketKey = clientIp + ":financial";
-            bucket = buckets.computeIfAbsent(bucketKey, k -> createBucket(20, 1));
+            bucket = getOrCreateBucket(bucketKey, 20, 1);
         } else {
-            // General API: 60 req/min
             bucketKey = clientIp + ":general";
-            bucket = buckets.computeIfAbsent(bucketKey, k -> createBucket(60, 1));
+            bucket = getOrCreateBucket(bucketKey, 60, 1);
         }
 
         if (bucket.tryConsume(1)) {
-            // Add rate limit headers
             response.addHeader("X-Rate-Limit-Remaining",
                     String.valueOf(bucket.getAvailableTokens()));
             return true;
@@ -61,18 +69,37 @@ public class RateLimitInterceptor implements HandlerInterceptor {
             response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
             response.setContentType("application/json;charset=UTF-8");
             response.getWriter().write("""
-                    {"timestamp":"%s","status":429,"error":"Too Many Requests","message":"Trop de requêtes. Veuillez r��essayer dans quelques instants."}
+                    {"timestamp":"%s","status":429,"error":"Too Many Requests","message":"Trop de requêtes. Veuillez réessayer dans quelques instants."}
                     """.formatted(java.time.LocalDateTime.now()));
             return false;
         }
     }
 
+    private Bucket getOrCreateBucket(String key, int capacityPerMinute, int refillMinutes) {
+        long now = System.currentTimeMillis();
+        BucketEntry entry = buckets.compute(key, (k, existing) -> {
+            if (existing == null) {
+                return new BucketEntry(createBucket(capacityPerMinute, refillMinutes), now);
+            }
+            return new BucketEntry(existing.bucket(), now); // update last access
+        });
+        return entry.bucket();
+    }
+
     /**
-     * Create a token bucket with the given capacity and refill rate.
-     *
-     * @param capacityPerMinute max tokens (requests) per minute
-     * @param refillMinutes     refill period in minutes
+     * SEC-9: Evict stale buckets every 5 minutes to prevent memory leak.
      */
+    @Scheduled(fixedRate = 300_000) // every 5 minutes
+    public void evictStaleBuckets() {
+        long now = System.currentTimeMillis();
+        int before = buckets.size();
+        buckets.entrySet().removeIf(e -> (now - e.getValue().lastAccessMillis()) > EVICTION_TTL_MILLIS);
+        int removed = before - buckets.size();
+        if (removed > 0) {
+            log.debug("Rate limiter: evicted {} stale buckets, {} remaining", removed, buckets.size());
+        }
+    }
+
     private Bucket createBucket(int capacityPerMinute, int refillMinutes) {
         Bandwidth limit = Bandwidth.builder()
                 .capacity(capacityPerMinute)

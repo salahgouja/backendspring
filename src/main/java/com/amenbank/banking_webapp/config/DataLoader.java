@@ -352,7 +352,7 @@ public class DataLoader implements CommandLineRunner {
                 List<Account> existing = accountRepository.findByUserIdAndAccountType(user.getId(), accountType);
                 if (!existing.isEmpty()) {
                         log.info("User {} already has a {} account: {}",
-                                        email, accountType, existing.get(0).getAccountNumber());
+                                        email, accountType, existing.getFirst().getAccountNumber());
                         return;
                 }
 

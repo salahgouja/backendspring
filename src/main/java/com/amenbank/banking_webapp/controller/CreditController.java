@@ -80,9 +80,10 @@ public class CreditController {
     @PreAuthorize("hasAnyRole('AGENT', 'ADMIN')")
     @Operation(summary = "Approuver ou rejeter une demande de crédit (Agent/Admin)")
     public ResponseEntity<CreditResponse> reviewCredit(
+            Authentication auth,
             @PathVariable UUID id,
             @Valid @RequestBody CreditReviewRequest request) {
-        return ResponseEntity.ok(creditService.reviewCredit(id, request));
+        return ResponseEntity.ok(creditService.reviewCredit(id, request, auth.getName()));
     }
 
     // ── Admin only ────────────────────────────────────────
@@ -90,20 +91,22 @@ public class CreditController {
     @PutMapping("/{id}/disburse")
     @PreAuthorize("hasRole('ADMIN')")
     @Operation(summary = "Décaisser un crédit approuvé (Admin uniquement)")
-    public ResponseEntity<CreditResponse> disburseCredit(@PathVariable UUID id) {
-        return ResponseEntity.ok(creditService.disburseCredit(id));
+    public ResponseEntity<CreditResponse> disburseCredit(Authentication auth, @PathVariable UUID id) {
+        return ResponseEntity.ok(creditService.disburseCredit(id, auth.getName()));
     }
 
     // ============================================================
     // GAP-6: Credit Document Endpoints (Pièces justificatives)
     // ============================================================
 
-    @PostMapping("/{id}/documents")
+    @PostMapping(value = "/{id}/documents", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     @Operation(summary = "Uploader un justificatif pour une demande de crédit",
             description = "Formats acceptés: PDF, JPEG, PNG, DOC, DOCX. Taille max: 10 MB. Max 10 documents par demande.")
     public ResponseEntity<CreditDocumentResponse> uploadDocument(
             Authentication auth,
             @PathVariable UUID id,
+            @io.swagger.v3.oas.annotations.Parameter(description = "Fichier justificatif à uploader",
+                    content = @io.swagger.v3.oas.annotations.media.Content(mediaType = MediaType.MULTIPART_FORM_DATA_VALUE))
             @RequestParam("file") MultipartFile file,
             @RequestParam(value = "documentType", required = false) CreditDocument.DocumentType documentType) {
         return ResponseEntity.ok(creditDocumentService.uploadDocument(auth.getName(), id, file, documentType));

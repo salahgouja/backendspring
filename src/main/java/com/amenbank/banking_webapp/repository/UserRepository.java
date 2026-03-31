@@ -33,4 +33,11 @@ public interface UserRepository extends JpaRepository<User, UUID> {
     long countByIsActiveFalse();
 
     long countByIs2faEnabledTrue();
+
+    // BUG-5: Paginated user listing
+    org.springframework.data.domain.Page<User> findByUserType(User.UserType userType, org.springframework.data.domain.Pageable pageable);
+
+    // BUG-6: Efficient count query for agency dashboard
+    @org.springframework.data.jpa.repository.Query("SELECT COUNT(u) FROM User u WHERE u.agency.id = :agencyId AND u.userType IN :types")
+    long countByAgencyIdAndUserTypeIn(UUID agencyId, List<User.UserType> types);
 }
