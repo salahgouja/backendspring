@@ -18,9 +18,5 @@ public interface AuditLogRepository extends JpaRepository<AuditLog, UUID>, JpaSp
 
     Page<AuditLog> findByActorEmailOrderByCreatedAtDesc(String actorEmail, Pageable pageable);
 
-    Page<AuditLog> findByActionOrderByCreatedAtDesc(AuditLog.AuditAction action, Pageable pageable);
-
     List<AuditLog> findByEntityTypeAndEntityIdOrderByCreatedAtDesc(String entityType, String entityId);
-
-    long countByActionAndCreatedAtAfter(AuditLog.AuditAction action, LocalDateTime after);
 }

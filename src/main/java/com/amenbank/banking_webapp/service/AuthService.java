@@ -14,10 +14,6 @@ import com.amenbank.banking_webapp.repository.NotificationRepository;
 import com.amenbank.banking_webapp.repository.UserRepository;
 import com.amenbank.banking_webapp.security.JwtTokenProvider;
 import com.amenbank.banking_webapp.security.UserDetailsServiceImpl;
-import dev.samstevens.totp.code.*;
-import dev.samstevens.totp.secret.DefaultSecretGenerator;
-import dev.samstevens.totp.secret.SecretGenerator;
-import dev.samstevens.totp.time.SystemTimeProvider;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
@@ -39,12 +35,10 @@ import org.springframework.web.util.HtmlUtils;
 
 import java.math.BigDecimal;
 import java.io.IOException;
-import java.net.URLEncoder;
 import java.net.MalformedURLException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.LocalDateTime;
 import java.util.List;
@@ -64,10 +58,6 @@ public class AuthService {
     private static final int MAX_FAILED_ATTEMPTS = 5;
     private static final int LOCK_DURATION_MINUTES = 30;
     private static final SecureRandom SECURE_RANDOM = new SecureRandom();
-    private static final HashingAlgorithm TOTP_ALGORITHM = HashingAlgorithm.SHA1;
-    private static final int TOTP_DIGITS = 6;
-    private static final int TOTP_PERIOD_SECONDS = 30;
-    private static final int TOTP_ALLOWED_TIME_STEPS = 1;
 
     private final UserRepository userRepository;
     private final AccountRepository accountRepository;
@@ -81,6 +71,7 @@ public class AuthService {
     private final com.amenbank.banking_webapp.repository.PasswordResetTokenRepository passwordResetTokenRepository;
     private final EmailService emailService;
     private final AccountNumberGenerator accountNumberGenerator;
+    private final TwoFactorService twoFactorService;
 
     @Value("${app.security.min-password-length:8}")
     private int minPasswordLength;
@@ -203,21 +194,12 @@ public class AuthService {
             throw new BankingException("2FA est déjà activé");
         }
 
-        SecretGenerator secretGenerator = new DefaultSecretGenerator();
-        String secret = normalizeTotpSecret(secretGenerator.generate());
+        String secret = twoFactorService.generateSecret();
         user.setTotpSecret(secret);
         userRepository.save(user);
 
         String issuer = "AmenBank";
-        String label = issuer + ":" + email;
-        String otpAuthUrl = String.format(
-                "otpauth://totp/%s?secret=%s&issuer=%s&algorithm=%s&digits=%d&period=%d",
-                urlEncode(label),
-                secret,
-                urlEncode(issuer),
-                TOTP_ALGORITHM.name(),
-                TOTP_DIGITS,
-                TOTP_PERIOD_SECONDS);
+        String otpAuthUrl = twoFactorService.buildOtpAuthUrl(issuer, email, secret);
 
         return Map.of("secret", secret, "otpAuthUrl", otpAuthUrl);
     }
@@ -518,33 +500,7 @@ public class AuthService {
     // Private — TOTP Verification
     // ============================================================
     private boolean verifyTotpCode(String secret, String code) {
-        if (secret == null || secret.isBlank() || code == null || code.isBlank()) {
-            return false;
-        }
-
-        CodeVerifier verifier = buildTotpVerifier();
-        return verifier.isValidCode(normalizeTotpSecret(secret), normalizeTotpCode(code));
-    }
-
-    private CodeVerifier buildTotpVerifier() {
-        DefaultCodeVerifier verifier = new DefaultCodeVerifier(
-                new DefaultCodeGenerator(TOTP_ALGORITHM, TOTP_DIGITS),
-                new SystemTimeProvider());
-        verifier.setTimePeriod(TOTP_PERIOD_SECONDS);
-        verifier.setAllowedTimePeriodDiscrepancy(TOTP_ALLOWED_TIME_STEPS);
-        return verifier;
-    }
-
-    private String normalizeTotpSecret(String secret) {
-        return secret == null ? null : secret.replace(" ", "").toUpperCase(Locale.ROOT);
-    }
-
-    private String normalizeTotpCode(String code) {
-        return code == null ? null : code.replaceAll("\\s+", "");
-    }
-
-    private String urlEncode(String value) {
-        return URLEncoder.encode(value, StandardCharsets.UTF_8);
+        return twoFactorService.isValidCode(secret, code);
     }
 
     private String resolveExtension(String contentType, String originalName) {

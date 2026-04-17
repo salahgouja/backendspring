@@ -14,12 +14,10 @@ import java.util.UUID;
 @Repository
 public interface LoanContractRepository extends JpaRepository<LoanContract, UUID> {
 
-    Optional<LoanContract> findByContractNumber(String contractNumber);
-
     @EntityGraph(attributePaths = {"product", "user", "user.agency"})
     List<LoanContract> findByUserIdOrderByCreatedAtDesc(UUID userId);
 
-    List<LoanContract> findByStatusOrderByCreatedAtDesc(LoanContract.LoanStatus status);
+
 
     /** All active variable-rate loans for a given reference index */
     @Query("SELECT lc FROM LoanContract lc JOIN lc.product p " +

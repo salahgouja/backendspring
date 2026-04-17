@@ -9,8 +9,6 @@ import com.amenbank.banking_webapp.exception.BankingException;
 import com.amenbank.banking_webapp.exception.BankingException.*;
 import com.amenbank.banking_webapp.model.*;
 import com.amenbank.banking_webapp.repository.*;
-import dev.samstevens.totp.code.*;
-import dev.samstevens.totp.time.SystemTimeProvider;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
@@ -26,7 +24,6 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.util.List;
-import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -38,10 +35,6 @@ public class TransferService {
     private static final String BEAN_NAME = "TransferService";
     private static final String USER_NOT_FOUND = "Utilisateur introuvable";
     private static final AtomicLong REFERENCE_SEQ = new AtomicLong(System.currentTimeMillis() % 100_000);
-    private static final HashingAlgorithm TOTP_ALGORITHM = HashingAlgorithm.SHA1;
-    private static final int TOTP_DIGITS = 6;
-    private static final int TOTP_PERIOD_SECONDS = 30;
-    private static final int TOTP_ALLOWED_TIME_STEPS = 1;
 
     private final TransferRepository transferRepository;
     private final AccountRepository accountRepository;
@@ -52,6 +45,7 @@ public class TransferService {
     private final BatchTransferItemRepository batchTransferItemRepository;
     private final AuditService auditService;
     private final EmailService emailService;
+    private final TwoFactorService twoFactorService;
 
     @Value("${app.transfer.max-amount-per-transaction:100000.000}")
     private BigDecimal maxAmountPerTransaction;
@@ -787,16 +781,7 @@ public class TransferService {
             throw new BankingException("Configuration 2FA incomplète. Veuillez reconfigurer le 2FA.");
         }
 
-        String normalizedSecret = user.getTotpSecret().replace(" ", "").toUpperCase(Locale.ROOT);
-        String normalizedCode = totpCode.replaceAll("\\s+", "");
-
-        DefaultCodeVerifier verifier = new DefaultCodeVerifier(
-                new DefaultCodeGenerator(TOTP_ALGORITHM, TOTP_DIGITS),
-                new SystemTimeProvider());
-        verifier.setTimePeriod(TOTP_PERIOD_SECONDS);
-        verifier.setAllowedTimePeriodDiscrepancy(TOTP_ALLOWED_TIME_STEPS);
-
-        if (!verifier.isValidCode(normalizedSecret, normalizedCode)) {
+        if (!twoFactorService.isValidCode(user.getTotpSecret(), totpCode)) {
             throw new BankingException("Code 2FA invalide. Virement refusé.");
         }
     }

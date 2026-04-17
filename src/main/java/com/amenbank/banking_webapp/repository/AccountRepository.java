@@ -20,7 +20,6 @@ public interface AccountRepository extends JpaRepository<Account, UUID> {
 
     Optional<Account> findByAccountType(Account.AccountType accountType);
 
-    List<Account> findByUserIdAndIsActiveTrue(UUID userId);
 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT a FROM Account a WHERE a.id = :id")
@@ -29,8 +28,6 @@ public interface AccountRepository extends JpaRepository<Account, UUID> {
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT a FROM Account a WHERE a.accountNumber = :accountNumber")
     Optional<Account> findByAccountNumberForUpdate(String accountNumber);
-
-    boolean existsByAccountNumber(String accountNumber);
 
     List<Account> findByUserIdAndAccountType(UUID userId, Account.AccountType accountType);
 
