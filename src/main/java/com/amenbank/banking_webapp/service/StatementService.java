@@ -9,6 +9,8 @@ import com.amenbank.banking_webapp.model.User;
 import com.amenbank.banking_webapp.repository.AccountRepository;
 import com.amenbank.banking_webapp.repository.TransactionRepository;
 import com.amenbank.banking_webapp.repository.UserRepository;
+import com.amenbank.banking_webapp.model.LoanPayment;
+import com.amenbank.banking_webapp.model.LoanContract;
 import com.lowagie.text.*;
 import com.lowagie.text.Font;
 import com.lowagie.text.pdf.PdfPCell;
@@ -206,6 +208,125 @@ public class StatementService {
         log.info("PDF statement generated for account {} ({} transactions)", account.getAccountNumber(),
                 transactions.size());
         return baos.toByteArray();
+    }
+
+    public byte[] generateLoanReceiptPdf(LoanPayment payment) {
+        LoanContract loan = payment.getLoanContract();
+        User user = loan.getUser();
+
+        try {
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            Document document = new Document(PageSize.A4, 36, 36, 50, 40);
+            PdfWriter.getInstance(document, baos);
+            document.open();
+
+            // ── Header / Bank Identity ───────────────────────
+            Paragraph bankName = new Paragraph("AMEN BANK", TITLE_FONT);
+            bankName.setAlignment(Element.ALIGN_CENTER);
+            document.add(bankName);
+
+            Paragraph bankInfo = new Paragraph(
+                    "Siège Social: Avenue Mohamed V — 1002 Tunis — RC B1111201997",
+                    FOOTER_FONT);
+            bankInfo.setAlignment(Element.ALIGN_CENTER);
+            bankInfo.setSpacingAfter(10);
+            document.add(bankInfo);
+
+            // ── Separator
+            PdfPTable separator = new PdfPTable(1);
+            separator.setWidthPercentage(100);
+            PdfPCell sepCell = new PdfPCell();
+            sepCell.setBorderWidthBottom(2);
+            sepCell.setBorderColorBottom(AMEN_BLUE);
+            sepCell.setBorderWidthTop(0);
+            sepCell.setBorderWidthLeft(0);
+            sepCell.setBorderWidthRight(0);
+            sepCell.setFixedHeight(5);
+            separator.addCell(sepCell);
+            document.add(separator);
+
+            // ── Title
+            Paragraph title = new Paragraph("REÇU DE PAIEMENT PRÊT", SUBTITLE_FONT);
+            title.setAlignment(Element.ALIGN_CENTER);
+            title.setSpacingBefore(10);
+            title.setSpacingAfter(15);
+            document.add(title);
+
+            // ── Info Table
+            PdfPTable infoTable = new PdfPTable(4);
+            infoTable.setWidthPercentage(100);
+            infoTable.setWidths(new float[] { 1.2f, 2f, 1.2f, 2f });
+
+            addInfoCell(infoTable, "Reçu N°:", "REC-" + payment.getId().toString().substring(0, 8).toUpperCase());
+            addInfoCell(infoTable, "Date:", payment.getPaymentDate().format(DATE_FMT));
+            addInfoCell(infoTable, "Contrat N°:", loan.getContractNumber());
+            addInfoCell(infoTable, "Produit:", loan.getProduct().getName());
+            addInfoCell(infoTable, "Emprunteur:", user.getFullNameFr());
+            addInfoCell(infoTable, "CIN/RC:", user.getCin() != null ? user.getCin() : "N/A");
+
+            infoTable.setSpacingAfter(15);
+            document.add(infoTable);
+
+            // ── Breakdown
+            PdfPTable txTable = new PdfPTable(2);
+            txTable.setWidthPercentage(100);
+            txTable.setWidths(new float[] { 3f, 1f });
+
+            addHeaderCell(txTable, "Description");
+            addHeaderCell(txTable, "Montant (" + loan.getCurrency() + ")");
+
+            addDataCell(txTable, "Principal Payé", Color.WHITE, false);
+            addDataCell(txTable, String.format("%.3f", payment.getPrincipalPaid()), Color.WHITE, true);
+
+            addDataCell(txTable, "Intérêts Payés", LIGHT_GRAY, false);
+            addDataCell(txTable, String.format("%.3f", payment.getInterestPaid()), LIGHT_GRAY, true);
+
+            if (payment.getPenaltyPaid() != null && payment.getPenaltyPaid().compareTo(BigDecimal.ZERO) > 0) {
+                addDataCell(txTable, "Pénalités", Color.WHITE, false);
+                addDataCell(txTable, String.format("%.3f", payment.getPenaltyPaid()), Color.WHITE, true);
+            }
+
+            PdfPCell totalLabel = new PdfPCell(new Phrase("Total Payé", CELL_FONT_BOLD));
+            totalLabel.setBackgroundColor(AMEN_BLUE);
+            totalLabel.setHorizontalAlignment(Element.ALIGN_LEFT);
+            totalLabel.setPadding(5);
+            txTable.addCell(totalLabel);
+
+            PdfPCell totalValue = new PdfPCell(new Phrase(String.format("%.3f", payment.getTotalPaid()), HEADER_FONT));
+            totalValue.setBackgroundColor(AMEN_BLUE);
+            totalValue.setHorizontalAlignment(Element.ALIGN_RIGHT);
+            totalValue.setPadding(5);
+            txTable.addCell(totalValue);
+
+            document.add(txTable);
+
+            // ── Situation
+            Paragraph summary = new Paragraph();
+            summary.setSpacingBefore(15);
+            summary.add(new Chunk("Situation après paiement\n", SUBTITLE_FONT));
+            summary.add(new Chunk(String.format(
+                    "Capital restant dû: %.3f %s  |  Échéances restantes: %d",
+                    payment.getOutstandingAfter(), loan.getCurrency(),
+                    loan.getTotalInstallments() - loan.getPaidInstallments()
+            ), VALUE_FONT));
+            document.add(summary);
+
+            // ── Footer
+            Paragraph footer = new Paragraph();
+            footer.setSpacingBefore(30);
+            footer.add(new Chunk(
+                    "Ce reçu est généré automatiquement par Amen Bank le " + LocalDateTime.now().format(DATETIME_FMT) + ".\n" +
+                            "Amen Bank — Tél: 71 148 000 — www.amenbank.com.tn",
+                    FOOTER_FONT));
+            footer.setAlignment(Element.ALIGN_CENTER);
+            document.add(footer);
+
+            document.close();
+            return baos.toByteArray();
+        } catch (DocumentException e) {
+            log.error("Failed to generate PDF receipt for payment {}: {}", payment.getId(), e.getMessage());
+            throw new BankingException("Erreur lors de la génération du reçu PDF");
+        }
     }
 
     private void addInfoCell(PdfPTable table, String label, String value) {

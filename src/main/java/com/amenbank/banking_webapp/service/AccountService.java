@@ -9,10 +9,12 @@ import com.amenbank.banking_webapp.repository.AccountRepository;
 import com.amenbank.banking_webapp.repository.NotificationRepository;
 import com.amenbank.banking_webapp.repository.TransactionRepository;
 import com.amenbank.banking_webapp.repository.UserRepository;
+import com.amenbank.banking_webapp.repository.specification.TransactionSpecification;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -95,9 +97,15 @@ public class AccountService {
         if (!account.getUser().getEmail().equals(email)) {
             throw new BankingException.ForbiddenException("Access denied");
         }
-        return transactionRepository.searchTransactions(
-                accountId, from, to, minAmount, maxAmount, type, category,
-                PageRequest.of(page, size))
+
+        String normalizedCategory = (category != null && !category.isBlank()) ? category.trim() : null;
+
+        return transactionRepository.findAll(
+                TransactionSpecification.withFilters(
+                        accountId, from, to, minAmount, maxAmount, type, normalizedCategory
+                ),
+                PageRequest.of(page, size, Sort.by(Sort.Direction.DESC, "createdAt"))
+        )
                 .map(this::toTransactionResponse);
     }
 

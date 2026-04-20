@@ -5,6 +5,7 @@ import com.amenbank.banking_webapp.dto.request.LoanSimulationRequest;
 import com.amenbank.banking_webapp.dto.response.AmortizationLineResponse;
 import com.amenbank.banking_webapp.dto.response.CreditResponse;
 import com.amenbank.banking_webapp.dto.response.LoanContractResponse;
+import com.amenbank.banking_webapp.dto.response.LoanPaymentResponse;
 import com.amenbank.banking_webapp.dto.response.LoanProductResponse;
 import com.amenbank.banking_webapp.dto.request.CreditSimulationRequest;
 import com.amenbank.banking_webapp.exception.BankingException;
@@ -13,6 +14,7 @@ import com.amenbank.banking_webapp.model.*;
 import com.amenbank.banking_webapp.repository.*;
 import com.amenbank.banking_webapp.service.CreditService;
 import com.amenbank.banking_webapp.service.LoanEngineService;
+import com.amenbank.banking_webapp.service.StatementService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.security.SecurityRequirement;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -42,6 +44,7 @@ public class LoanController {
     private final ReferenceRateRepository referenceRateRepository;
     private final UserRepository userRepository;
     private final AccountRepository accountRepository;
+    private final StatementService statementService;
 
     // ════════════════════════════════════════════════════════════
     // LOAN PRODUCTS
@@ -194,7 +197,7 @@ public class LoanController {
     }
 
     // ════════════════════════════════════════════════════════════
-    // LOAN SIMULATION (No persistence)
+    // LOAN SIMULATION
     // ════════════════════════════════════════════════════════════
 
     @PostMapping("/simulate")
@@ -425,9 +428,13 @@ public class LoanController {
 
     @GetMapping("/contracts/{id}/payments")
     @Operation(summary = "Get payment history for a loan")
-    public ResponseEntity<List<LoanPayment>> getPayments(Authentication auth, @PathVariable UUID id) {
+    public ResponseEntity<List<LoanPaymentResponse>> getPayments(Authentication auth, @PathVariable UUID id) {
         requireLoanAccess(auth, id);
-        return ResponseEntity.ok(loanEngineService.getLoanPayments(id));
+        List<LoanPaymentResponse> payments = loanEngineService.getLoanPayments(id)
+                .stream()
+                .map(this::toPaymentResponse)
+                .toList();
+        return ResponseEntity.ok(payments);
     }
 
     @GetMapping("/contracts/{id}/rate-revisions")
@@ -500,11 +507,11 @@ public class LoanController {
     // GAP-H: PAYMENT RECEIPT
     // ════════════════════════════════════════════════════════════
 
-    @GetMapping("/payments/{paymentId}/receipt")
+    @GetMapping(value = "/payments/{paymentId}/receipt", produces = org.springframework.http.MediaType.APPLICATION_PDF_VALUE)
     @Operation(summary = "Get payment receipt (proof of payment)",
-            description = "Returns a detailed receipt for a specific loan payment. " +
+            description = "Returns a detailed PDF receipt for a specific loan payment. " +
                           "Includes borrower info, contract details, payment breakdown, and outstanding balance.")
-    public ResponseEntity<Map<String, Object>> getPaymentReceipt(
+    public ResponseEntity<byte[]> getPaymentReceipt(
             Authentication auth,
             @PathVariable UUID paymentId) {
 
@@ -520,46 +527,11 @@ public class LoanController {
             throw new BankingException.ForbiddenException("Ce paiement ne vous appartient pas");
         }
 
-        Map<String, Object> receipt = new LinkedHashMap<>();
-        receipt.put("receiptNumber", "REC-" + payment.getId().toString().substring(0, 8).toUpperCase());
-        receipt.put("paymentDate", payment.getPaymentDate());
-        receipt.put("issuedAt", payment.getCreatedAt());
-
-        // Borrower info
-        Map<String, Object> borrower = new LinkedHashMap<>();
-        borrower.put("name", loan.getUser().getFullNameFr());
-        borrower.put("email", loan.getUser().getEmail());
-        receipt.put("borrower", borrower);
-
-        // Contract info
-        Map<String, Object> contract = new LinkedHashMap<>();
-        contract.put("contractNumber", loan.getContractNumber());
-        contract.put("productName", loan.getProduct().getName());
-        contract.put("principalAmount", loan.getPrincipalAmount());
-        contract.put("currentRate", loan.getCurrentRate());
-        contract.put("currency", loan.getCurrency());
-        receipt.put("contract", contract);
-
-        // Payment breakdown
-        Map<String, Object> breakdown = new LinkedHashMap<>();
-        breakdown.put("totalPaid", payment.getTotalPaid());
-        breakdown.put("principalPaid", payment.getPrincipalPaid());
-        breakdown.put("interestPaid", payment.getInterestPaid());
-        breakdown.put("penaltyPaid", payment.getPenaltyPaid());
-        breakdown.put("paymentType", payment.getPaymentType().name());
-        receipt.put("paymentBreakdown", breakdown);
-
-        // After payment
-        Map<String, Object> afterPayment = new LinkedHashMap<>();
-        afterPayment.put("outstandingPrincipal", payment.getOutstandingAfter());
-        afterPayment.put("remainingInstallments", loan.getTotalInstallments() - loan.getPaidInstallments());
-        afterPayment.put("loanStatus", loan.getStatus().name());
-        receipt.put("afterPayment", afterPayment);
-
-        receipt.put("bankName", "Amen Bank");
-        receipt.put("disclaimer", "Ce reçu est généré automatiquement par le système bancaire Amen Bank.");
-
-        return ResponseEntity.ok(receipt);
+        byte[] pdfBytes = statementService.generateLoanReceiptPdf(payment);
+        
+        return ResponseEntity.ok()
+                .header(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"recu_paiement_" + paymentId + ".pdf\"")
+                .body(pdfBytes);
     }
 
     // ════════════════════════════════════════════════════════════
@@ -701,6 +673,20 @@ public class LoanController {
                 .rateApplied(line.getRateApplied()).status(line.getStatus().name())
                 .paidDate(line.getPaidDate()).paidAmount(line.getPaidAmount())
                 .penaltyAmount(line.getPenaltyAmount())
+                .build();
+    }
+
+    private LoanPaymentResponse toPaymentResponse(LoanPayment payment) {
+        return LoanPaymentResponse.builder()
+                .id(payment.getId())
+                .paymentDate(payment.getPaymentDate())
+                .totalPaid(payment.getTotalPaid())
+                .principalPaid(payment.getPrincipalPaid())
+                .interestPaid(payment.getInterestPaid())
+                .penaltyPaid(payment.getPenaltyPaid())
+                .outstandingAfter(payment.getOutstandingAfter())
+                .paymentType(payment.getPaymentType() != null ? payment.getPaymentType().name() : null)
+                .createdAt(payment.getCreatedAt())
                 .build();
     }
 

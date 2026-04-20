@@ -53,7 +53,7 @@ public class DataLoader implements CommandLineRunner {
                 seedAgencies();
 
                 // ── 2. Seed Users ─────────────────────────────────────
-                // ADMIN (no agency)
+                // ADMIN
                 seedUser("admin.superuser@amenbank.tn", "20200001", "AdminAmen2024!",
                                 "مدير النظام الرئيسي", "Super Admin", "20000001",
                                 User.UserType.ADMIN, null, null);
@@ -107,7 +107,7 @@ public class DataLoader implements CommandLineRunner {
         }
 
         // ============================================================
-        // Seed 68 Amen Bank Agencies
+        // Seed Amen Bank Agencies
         // ============================================================
         private void seedAgencies() {
                 if (agencyRepository.count() > 0) {
